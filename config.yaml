@@ -1,0 +1,45 @@
+# PFCP Message Generator Configuration
+
+# SMF (this tool) configuration
+smf:
+  address: "192.168.1.10"       # Local IP to bind for PFCP
+  port: 8805                     # Local PFCP port
+
+# Target UPF configuration
+upf:
+  address: "192.168.1.20"       # UPF IP address
+  port: 8805                     # UPF PFCP port
+
+# Association configuration
+association:
+  enabled: true                  # Enable PFCP Association Setup before session messages
+
+# Session configuration
+session:
+  seid_start: 1                  # Starting SEID value
+  seid_strategy: "sequential"    # "sequential" or "random"
+  ue_ip_pool: "10.60.0.0/16"    # UE IPv4 address pool (CIDR notation)
+  strip_ipv6: true               # Strip IPv6 from UE IP Address IEs, force IPv4-only
+  cleanup_on_exit: false         # Delete all sessions on shutdown
+
+# Timing configuration
+timing:
+  message_interval_ms: 100       # Delay between messages in ms (0 = no delay)
+  response_timeout_ms: 5000      # Timeout waiting for UPF response
+  max_retries: 3                 # Max retransmission attempts
+
+# Input configuration
+input:
+  pcap_file: "capture.pcap"     # Path to input PCAP file
+
+# Logging configuration
+logging:
+  level: "info"                  # "debug", "info", "warn", "error"
+  file: ""                       # Log file path (empty = console only)
+  console: true                  # Log to stdout
+
+# Statistics configuration
+stats:
+  enabled: true                  # Enable statistics collection
+  report_interval_sec: 10        # Periodic report interval (0 = final report only)
+  export_file: ""                # Export stats to JSON file (empty = no export)

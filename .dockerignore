@@ -1,0 +1,6 @@
+pfcp-generator
+mockupf
+*.out
+*.html
+coverage.*
+.git

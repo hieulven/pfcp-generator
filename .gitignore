@@ -1,0 +1,23 @@
+# Binaries
+/pfcp-generator
+/mockupf
+
+# Test coverage
+coverage.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Stats export
+*.json
+!package.json
+
+# Claude Code
+.claude/
