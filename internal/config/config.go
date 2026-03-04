@@ -43,13 +43,15 @@ type SessionConfig struct {
 }
 
 type TimingConfig struct {
-	MessageIntervalMs int `yaml:"message_interval_ms" mapstructure:"message_interval_ms"`
-	ResponseTimeoutMs int `yaml:"response_timeout_ms" mapstructure:"response_timeout_ms"`
-	MaxRetries        int `yaml:"max_retries"         mapstructure:"max_retries"`
+	MessageIntervalMs int `yaml:"message_interval_ms"  mapstructure:"message_interval_ms"`
+	ResponseTimeoutMs int `yaml:"response_timeout_ms"  mapstructure:"response_timeout_ms"`
+	MaxRetries        int `yaml:"max_retries"          mapstructure:"max_retries"`
+	RepeatIntervalMs  int `yaml:"repeat_interval_ms"   mapstructure:"repeat_interval_ms"`
 }
 
 type InputConfig struct {
-	PcapFile string `yaml:"pcap_file" mapstructure:"pcap_file"`
+	PcapFile    string `yaml:"pcap_file"    mapstructure:"pcap_file"`
+	RepeatCount int    `yaml:"repeat_count" mapstructure:"repeat_count"`
 }
 
 type LoggingConfig struct {
@@ -73,9 +75,11 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("session.seid_strategy", "sequential")
 	v.SetDefault("session.strip_ipv6", true)
 	v.SetDefault("session.cleanup_on_exit", false)
+	v.SetDefault("input.repeat_count", 1)
 	v.SetDefault("timing.message_interval_ms", 100)
 	v.SetDefault("timing.response_timeout_ms", 5000)
 	v.SetDefault("timing.max_retries", 3)
+	v.SetDefault("timing.repeat_interval_ms", 0)
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.console", true)
 	v.SetDefault("stats.enabled", true)
@@ -125,5 +129,13 @@ func (c *Config) Summary() string {
 	sb.WriteString(fmt.Sprintf("  Msg Interval:  %dms\n", c.Timing.MessageIntervalMs))
 	sb.WriteString(fmt.Sprintf("  Timeout:       %dms (retries: %d)\n", c.Timing.ResponseTimeoutMs, c.Timing.MaxRetries))
 	sb.WriteString(fmt.Sprintf("  Cleanup:       %v\n", c.Session.CleanupOnExit))
+	if c.Input.RepeatCount == 0 {
+		sb.WriteString("  Repeat:        infinite\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("  Repeat:        %d time(s)\n", c.Input.RepeatCount))
+	}
+	if c.Timing.RepeatIntervalMs > 0 {
+		sb.WriteString(fmt.Sprintf("  Repeat Delay:  %dms\n", c.Timing.RepeatIntervalMs))
+	}
 	return sb.String()
 }

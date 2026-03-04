@@ -104,11 +104,32 @@ func (m *Manager) SetSEIDMappings(mappings []types.SEIDMapping) {
 	}
 }
 
+// StartResponseHandler starts the goroutine that dispatches UPF responses to pending transactions.
+// Call this once before the first Replay call; it lives for the lifetime of ctx.
+func (m *Manager) StartResponseHandler(ctx context.Context) {
+	go m.handleResponses(ctx)
+}
+
+// Reset clears all session state so the manager can be reused for another replay iteration.
+// It releases any resources still held by sessions that were not explicitly deleted.
+func (m *Manager) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, s := range m.byLocalSEID {
+		m.seidAlloc.Release(s.LocalSEID)
+		if s.UEIP != nil {
+			m.ipPool.Release(s.UEIP)
+		}
+	}
+
+	m.byOriginalCPSEID = make(map[uint64]*types.SessionInfo)
+	m.byOriginalRemoteSEID = make(map[uint64]*types.SessionInfo)
+	m.byLocalSEID = make(map[uint64]*types.SessionInfo)
+}
+
 // Replay processes all PFCP messages from the pcap in order.
 func (m *Manager) Replay(ctx context.Context, messages []types.RawPFCPMessage) error {
-	// Start response handler
-	go m.handleResponses(ctx)
-
 	interval := time.Duration(m.cfg.Timing.MessageIntervalMs) * time.Millisecond
 
 	for i, raw := range messages {

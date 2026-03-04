@@ -56,6 +56,8 @@ file, modifying session-specific identifiers, and replaying them to a target UPF
 	rootCmd.Flags().Bool("cleanup", false, "Delete all sessions on exit")
 	rootCmd.Flags().Bool("no-association", false, "Disable PFCP Association Setup")
 	rootCmd.Flags().Bool("strip-ipv6", true, "Strip IPv6 from UE IP Address IEs")
+	rootCmd.Flags().Int("repeat", 0, "Number of replay iterations (0 = infinite, default: 1)")
+	rootCmd.Flags().Int("repeat-interval", 0, "Delay between repeat iterations in ms")
 
 	// Bind CLI flags to viper
 	v := viper.New()
@@ -72,6 +74,8 @@ file, modifying session-specific identifiers, and replaying them to a target UPF
 	bindFlag(v, rootCmd, "log-level", "logging.level")
 	bindFlag(v, rootCmd, "cleanup", "session.cleanup_on_exit")
 	bindFlag(v, rootCmd, "strip-ipv6", "session.strip_ipv6")
+	bindFlag(v, rootCmd, "repeat", "input.repeat_count")
+	bindFlag(v, rootCmd, "repeat-interval", "timing.repeat_interval_ms")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -214,17 +218,61 @@ func run(cmd *cobra.Command, args []string) error {
 		mgr.SetSEIDMappings(parseResult.SEIDMappings)
 	}
 
-	// Run replay
+	// Start response handler once (shared across all replay iterations)
+	mgr.StartResponseHandler(ctx)
+
+	repeatCount := cfg.Input.RepeatCount
+	repeatInterval := time.Duration(cfg.Timing.RepeatIntervalMs) * time.Millisecond
+
 	fmt.Println("Sending messages to UPF...")
-	if err := mgr.Replay(ctx, messages); err != nil {
+
+	for iter := 1; repeatCount == 0 || iter <= repeatCount; iter++ {
 		if ctx.Err() != nil {
-			log.Info("Replay interrupted by shutdown")
-		} else {
+			log.Info("Replay cancelled")
+			break
+		}
+
+		if repeatCount != 1 {
+			if repeatCount == 0 {
+				fmt.Printf("\n[Iteration %d - running indefinitely, Ctrl+C to stop]\n", iter)
+			} else {
+				fmt.Printf("\n[Iteration %d/%d]\n", iter, repeatCount)
+			}
+		}
+
+		if err := mgr.Replay(ctx, messages); err != nil {
+			if ctx.Err() != nil {
+				log.Info("Replay interrupted by shutdown")
+				break
+			}
 			log.WithError(err).Error("Replay failed")
+		}
+
+		isLast := repeatCount > 0 && iter >= repeatCount
+		if isLast {
+			break
+		}
+
+		if ctx.Err() != nil {
+			break
+		}
+
+		// Between iterations: clean up active sessions, reset state, then wait
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		mgr.CleanupSessions(cleanupCtx)
+		cleanupCancel()
+
+		mgr.Reset()
+
+		if repeatInterval > 0 {
+			select {
+			case <-ctx.Done():
+			case <-time.After(repeatInterval):
+			}
 		}
 	}
 
-	// Cleanup sessions if configured
+	// Cleanup sessions if configured (after final iteration)
 	if cfg.Session.CleanupOnExit {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		mgr.CleanupSessions(cleanupCtx)
@@ -332,5 +380,13 @@ func bindViperFlags(v *viper.Viper, cmd *cobra.Command) {
 	if cmd.Flags().Changed("strip-ipv6") {
 		val, _ := cmd.Flags().GetBool("strip-ipv6")
 		v.Set("session.strip_ipv6", val)
+	}
+	if cmd.Flags().Changed("repeat") {
+		val, _ := cmd.Flags().GetInt("repeat")
+		v.Set("input.repeat_count", val)
+	}
+	if cmd.Flags().Changed("repeat-interval") {
+		val, _ := cmd.Flags().GetInt("repeat-interval")
+		v.Set("timing.repeat_interval_ms", val)
 	}
 }
