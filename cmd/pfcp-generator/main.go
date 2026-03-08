@@ -56,7 +56,7 @@ file, modifying session-specific identifiers, and replaying them to a target UPF
 	rootCmd.Flags().Bool("cleanup", false, "Delete all sessions on exit")
 	rootCmd.Flags().Bool("no-association", false, "Disable PFCP Association Setup")
 	rootCmd.Flags().Bool("strip-ipv6", true, "Strip IPv6 from UE IP Address IEs")
-	rootCmd.Flags().Int("repeat", 0, "Number of replay iterations (0 = infinite, default: 1)")
+	rootCmd.Flags().Int("repeat", 1, "Number of replay iterations (0 = infinite)")
 	rootCmd.Flags().Int("repeat-interval", 0, "Delay between repeat iterations in ms")
 
 	// Bind CLI flags to viper

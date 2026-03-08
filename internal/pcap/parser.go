@@ -201,15 +201,11 @@ func (p *Parser) CountMessages(filename string) (map[string]int, error) {
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	counts := make(map[string]int)
+	defragger := ip4defrag.NewIPv4Defragmenter()
 
 	for packet := range packetSource.Packets() {
-		udpLayer := packet.Layer(layers.LayerTypeUDP)
-		if udpLayer == nil {
-			continue
-		}
-
-		udp, ok := udpLayer.(*layers.UDP)
-		if !ok {
+		udp, _, _ := defragAndGetUDP(packet, defragger)
+		if udp == nil {
 			continue
 		}
 

@@ -26,6 +26,24 @@ apt-get install libpcap-dev
 xcode-select --install
 ```
 
+## Pre-built Binaries
+
+Pre-built linux/amd64 binaries are available in the `dist/` directory, compiled on UBI 8.10 and compatible with RHEL 7.9+. The only runtime dependency is `libpcap`:
+
+```bash
+# RHEL 7.9
+yum install -y libpcap
+
+# RHEL 8.10
+dnf install -y libpcap
+```
+
+Copy to the target machine and run:
+
+```bash
+scp dist/pfcp-generator user@host:/usr/local/bin/
+```
+
 ## Build
 
 ```bash
@@ -146,6 +164,8 @@ The tool reads from a YAML config file (default `config.yaml`) and/or CLI flags.
 | `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 | `--no-association` | `false` | Skip PFCP Association Setup |
 | `--strip-ipv6` | `true` | Strip IPv6 from UE IP Address IEs |
+| `--repeat` | `1` | Number of replay iterations (0 = infinite) |
+| `--repeat-interval` | `0` | Delay between repeat iterations (ms) |
 | `--cleanup` | `false` | Delete all active sessions on exit |
 | `--dry-run` | `false` | Parse only, no network traffic |
 | `--stats-only` | `false` | Print pcap message counts and exit |
@@ -177,9 +197,11 @@ timing:
   message_interval_ms: 100
   response_timeout_ms: 5000
   max_retries: 3
+  repeat_interval_ms: 0
 
 input:
   pcap_file: "capture.pcap"
+  repeat_count: 1
 
 logging:
   level: "info"
@@ -215,6 +237,22 @@ Enabled by default. Sends a PFCP Association Setup Request before any session me
 ### Session Cleanup
 
 When `--cleanup` is set, all sessions that are still active after replay completes are deleted by sending Session Deletion Requests. This is useful when the pcap does not contain deletions for all sessions.
+
+### Pcap Repeat
+
+The `--repeat` flag controls how many times the pcap is replayed. Between iterations, active sessions are cleaned up and session state is reset (SEIDs and UE IPs are released back to the pool).
+
+```bash
+# Replay 5 times with 1 second between iterations
+pfcp-generator --pcap capture.pcap --repeat 5 --repeat-interval 1000 ...
+
+# Replay indefinitely until Ctrl+C
+pfcp-generator --pcap capture.pcap --repeat 0 ...
+```
+
+### IPv4 Fragment Reassembly
+
+PFCP messages that span multiple IP fragments (e.g. large Session Establishment Requests with many PDRs/FARs) are transparently reassembled before parsing. This applies to both replay and stats-only modes.
 
 ### Retransmission
 
