@@ -46,7 +46,7 @@ The tool acts as an **SMF (Session Management Function)** that replays PFCP traf
 - **`internal/pfcp/`** — Decodes/encodes PFCP messages using `wmnsk/go-pfcp`; `modifier.go` replaces F-SEID, UE IP, sequence numbers while preserving PDR/FAR/QER/URR/BAR IDs
 - **`internal/session/`** — `manager.go` drives session lifecycle (Replay + ReplayStress modes); `grouper.go` groups pcap messages into session templates; `ratelimiter.go` provides batch-ticker rate limiting; `seid_allocator.go` uses atomic counter + free-list; `ip_pool.go` uses free-list stack for O(1) UE IP allocation
 - **`internal/network/`** — Lock-free UDP client (`sender.go`), async receiver with `sync.Pool` buffers (`receiver.go`), 64-shard transaction tracker (`transaction.go`)
-- **`internal/stats/`** — Metrics collection and console/JSON reporting
+- **`internal/stats/`** — Metrics collection, console/JSON reporting, and live TUI dashboard for stress mode
 - **`pkg/types/`** — Shared types: `RawPFCPMessage`, `SessionInfo`, `TransactionResult`
 - **`test/mockupf/`** — Standalone mock UPF that generates valid PFCP responses; used for integration testing
 

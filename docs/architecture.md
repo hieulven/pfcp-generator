@@ -411,10 +411,11 @@ type TransactionTracker interface {
 - Active session count
 - Response time per message (min, avg, max, p99)
 - Overall duration
-- Message throughput (msg/s)
+- TPS (transactions per second, current and average)
 
 **Reporter (`reporter.go`):**
-- Periodic console output at configurable interval
+- **Normal mode:** Periodic console output at configurable interval
+- **Stress mode:** Live terminal dashboard (1-second refresh) with ANSI cursor control, box-drawing table, per-message-type breakdown, TPS tracking, and comma-formatted numbers. Logs auto-redirect to file.
 - Final summary on completion
 - Optional JSON export to file
 

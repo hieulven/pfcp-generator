@@ -65,6 +65,7 @@ file, modifying session-specific identifiers, and replaying them to a target UPF
 	rootCmd.Flags().Int("tps", 0, "Target transactions per second (stress mode)")
 	rootCmd.Flags().Int("active-sessions", 0, "Max concurrent active sessions (stress mode)")
 	rootCmd.Flags().Int("duration", 0, "Test duration in seconds (stress mode, 0=unlimited)")
+	rootCmd.Flags().String("log-file", "", "Log file path (auto-set to pfcp-generator.log in stress mode)")
 
 	// Bind CLI flags to viper
 	v := viper.New()
@@ -126,6 +127,11 @@ func run(cmd *cobra.Command, args []string) error {
 	cfg, err := config.LoadWithViper(v)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// In stress mode, auto-redirect logs to file to keep terminal clean for dashboard
+	if cfg.Stress.Enabled && cfg.Logging.File == "" {
+		cfg.Logging.File = "pfcp-generator.log"
 	}
 
 	// Setup logging
@@ -217,7 +223,9 @@ func run(cmd *cobra.Command, args []string) error {
 	// Create stats collector and reporter
 	statsCollector := stats.NewCollector()
 	reporter := stats.NewReporter(statsCollector, cfg.Stats.ReportIntervalSec, cfg.Stats.ExportFile)
-	if cfg.Stats.Enabled {
+
+	// Start periodic report only for normal mode (stress mode uses live dashboard)
+	if cfg.Stats.Enabled && !cfg.Stress.Enabled {
 		reporter.StartPeriodicReport(ctx)
 	}
 
@@ -257,7 +265,14 @@ func runStressMode(ctx context.Context, mgr *session.Manager, cfg *config.Config
 	} else {
 		fmt.Println(", unlimited duration")
 	}
+	if cfg.Logging.File != "" {
+		fmt.Printf("Logs: %s\n", cfg.Logging.File)
+	}
 	fmt.Println()
+
+	// Start live dashboard
+	reporter.SetTargetTPS(cfg.Stress.TPS)
+	stopDashboard := reporter.StartLiveDashboard(ctx)
 
 	duration := time.Duration(cfg.Stress.DurationSec) * time.Second
 
@@ -269,6 +284,10 @@ func runStressMode(ctx context.Context, mgr *session.Manager, cfg *config.Config
 		}
 	}
 
+	// Stop dashboard and render final state
+	stopDashboard()
+	reporter.PrintFinalDashboard()
+
 	// Cleanup
 	if cfg.Session.CleanupOnExit {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -277,7 +296,6 @@ func runStressMode(ctx context.Context, mgr *session.Manager, cfg *config.Config
 	}
 
 	if cfg.Stats.Enabled {
-		reporter.PrintFinalReport()
 		if err := reporter.ExportJSON(); err != nil {
 			log.WithError(err).Warn("Failed to export statistics")
 		}
@@ -454,6 +472,10 @@ func bindViperFlags(v *viper.Viper, cmd *cobra.Command) {
 	if cmd.Flags().Changed("repeat-interval") {
 		val, _ := cmd.Flags().GetInt("repeat-interval")
 		v.Set("timing.repeat_interval_ms", val)
+	}
+	if cmd.Flags().Changed("log-file") {
+		val, _ := cmd.Flags().GetString("log-file")
+		v.Set("logging.file", val)
 	}
 	// Stress test flags
 	if cmd.Flags().Changed("stress") {

@@ -118,6 +118,32 @@ The tool groups pcap messages into session templates (Establishment + Modificati
 - `sync.Pool` for receive buffer reuse
 - Batch-ticker rate limiter (50 tokens/ms at 50K TPS)
 - Free-list based IP pool and SEID allocator (O(1) allocate/release)
+- Live terminal dashboard with 1-second refresh (TPS, sessions, response times, per-message-type stats)
+- Logs auto-redirect to file (`pfcp-generator.log`) to keep the terminal clean
+
+**Live dashboard output:**
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    PFCP Generator - Stress Test Dashboard                    │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Elapsed: 0m10s          TPS: 2,377 current / 2,377 avg  (target: 3,000)     │
+│ Total Sent: 23,780         Total Received: 23,720                           │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Sessions   Established: 6,207     Active: 6,195     Deleted: 12   Failed: 0 │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Response   Min: 23us       Avg: 157us      P99: 2.000ms    Max: 9.403ms     │
+├──────────────────────┬───────────┬───────────┬───────────┬─────────┬─────────┤
+│ Message Type         │      Sent │      Recv │   Success │  Failed │ Timeout │
+├──────────────────────┼───────────┼───────────┼───────────┼─────────┼─────────┤
+│ Establishment Req    │     6,207 │         0 │     6,207 │       0 │       0 │
+│ Establishment Resp   │         0 │     6,207 │         0 │       0 │       0 │
+│ Modification Req     │    17,550 │         0 │    17,501 │       0 │      49 │
+│ Modification Resp    │         0 │    17,501 │         0 │       0 │       0 │
+│ Deletion Req         │        23 │         0 │        12 │       0 │      11 │
+│ Deletion Resp        │         0 │        12 │         0 │       0 │       0 │
+└──────────────────────┴───────────┴───────────┴───────────┴─────────┴─────────┘
+```
 
 ### 2. Replay Mode (default)
 
@@ -205,6 +231,7 @@ The tool reads from a YAML config file (default `config.yaml`) and/or CLI flags.
 | `--tps` | `50000` | Target transactions per second (stress mode) |
 | `--active-sessions` | `10000` | Max concurrent active sessions (stress mode) |
 | `--duration` | `0` | Test duration in seconds (stress mode, 0=unlimited) |
+| `--log-file` | | Log file path (auto-set to `pfcp-generator.log` in stress mode) |
 
 ### Config File
 
@@ -374,7 +401,7 @@ internal/
     seid_allocator.go  Atomic counter + free-list SEID allocation
   stats/
     collector.go       Atomic counters + fixed-bucket histogram
-    reporter.go        Console and JSON reporting
+    reporter.go        Console/JSON reporting + live TUI dashboard
 pkg/types/             Shared data types
 test/
   mockupf/             High-performance mock UPF (sharded, multi-reader)
