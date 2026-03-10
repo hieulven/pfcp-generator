@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"net"
+	"sync"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/wmnsk/go-pfcp/message"
@@ -21,11 +22,19 @@ type Receiver struct {
 	msgChan chan ReceivedMessage
 }
 
+var bufPool = sync.Pool{
+	New: func() interface{} { return make([]byte, 65535) },
+}
+
 // NewReceiver creates a new receiver using the same UDP connection as the sender.
-func NewReceiver(conn *net.UDPConn) *Receiver {
+// bufSize sets the channel buffer capacity; use 0 for the default (1000).
+func NewReceiver(conn *net.UDPConn, bufSize int) *Receiver {
+	if bufSize <= 0 {
+		bufSize = 1000
+	}
 	return &Receiver{
 		conn:    conn,
-		msgChan: make(chan ReceivedMessage, 1000),
+		msgChan: make(chan ReceivedMessage, bufSize),
 	}
 }
 
@@ -42,7 +51,6 @@ func (r *Receiver) Messages() <-chan ReceivedMessage {
 func (r *Receiver) listen(ctx context.Context) {
 	defer close(r.msgChan)
 
-	buf := make([]byte, 65535)
 	for {
 		select {
 		case <-ctx.Done():
@@ -50,8 +58,10 @@ func (r *Receiver) listen(ctx context.Context) {
 		default:
 		}
 
+		buf := bufPool.Get().([]byte)
 		n, addr, err := r.conn.ReadFromUDP(buf)
 		if err != nil {
+			bufPool.Put(buf)
 			if ctx.Err() != nil {
 				return // Context cancelled, normal shutdown
 			}
@@ -59,8 +69,10 @@ func (r *Receiver) listen(ctx context.Context) {
 			continue
 		}
 
+		// Copy data out so we can return buffer to pool
 		data := make([]byte, n)
 		copy(data, buf[:n])
+		bufPool.Put(buf)
 
 		msg, err := message.Parse(data)
 		if err != nil {

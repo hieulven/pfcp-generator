@@ -3,14 +3,14 @@ package network
 import (
 	"fmt"
 	"net"
-	"sync"
 )
 
 // UDPClient handles UDP communication with the UPF.
+// WriteToUDP is goroutine-safe (kernel serializes UDP writes),
+// so no mutex is needed for concurrent sends.
 type UDPClient struct {
 	conn    *net.UDPConn
 	upfAddr *net.UDPAddr
-	mu      sync.Mutex
 }
 
 // NewUDPClient creates a new UDP client bound to the SMF address and targeting the UPF.
@@ -36,11 +36,8 @@ func NewUDPClient(smfAddr string, smfPort int, upfAddr string, upfPort int) (*UD
 	}, nil
 }
 
-// Send transmits data to the UPF.
+// Send transmits data to the UPF. Goroutine-safe without external locking.
 func (c *UDPClient) Send(data []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	_, err := c.conn.WriteToUDP(data, c.upfAddr)
 	if err != nil {
 		return fmt.Errorf("failed to send to UPF %s: %w", c.upfAddr, err)

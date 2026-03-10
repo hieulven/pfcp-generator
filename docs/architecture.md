@@ -76,6 +76,82 @@ The PFCP Message Generator is a Go application that emulates an SMF node by repl
 └──────────────────────────────────────────────────────────────┘
 ```
 
+### 3.2 Stress Test Mode Architecture
+
+```
+                         ┌──────────────────────────────────────────┐
+                         │            Stress Controller              │
+                         │                                          │
+                         │  ┌──────────┐    ┌───────────────────┐  │
+                         │  │  Timer    │    │  Session Semaphore │  │
+                         │  │ (N hrs)   │    │   (cap = 10,000)  │  │
+                         │  └────┬─────┘    └────────┬──────────┘  │
+                         │       │                   │              │
+                         │  ┌────▼───────────────────▼──────────┐  │
+                         │  │         Feeder Goroutine           │  │
+                         │  │  Enqueue templates round-robin     │  │
+                         │  │  Block on semaphore when full      │  │
+                         │  └────────────┬──────────────────────┘  │
+                         └───────────────┼──────────────────────────┘
+                                         │ workCh
+              ┌──────────────────────────┼──────────────────────────┐
+              │                          │                          │
+        ┌─────▼─────┐             ┌─────▼─────┐             ┌─────▼─────┐
+        │  Worker 0  │             │  Worker 1  │    ...      │ Worker N-1│
+        │            │             │            │             │           │
+        │ for tmpl   │             │ for tmpl   │             │ for tmpl  │
+        │  in workCh:│             │  in workCh:│             │ in workCh:│
+        │   rate.Wait│             │   rate.Wait│             │  rate.Wait│
+        │   send()   │             │   send()   │             │  send()   │
+        │   waitResp │             │   waitResp │             │  waitResp │
+        │  <-sem     │             │  <-sem     │             │  <-sem    │
+        └─────┬──────┘             └─────┬──────┘             └─────┬────┘
+              │                          │                          │
+              └───────────┬──────────────┘                          │
+                          │   Send (lock-free)                      │
+                    ┌─────▼─────────────────────────────────────────▼──┐
+                    │                    UDPConn                        │
+                    │        WriteToUDP (goroutine-safe)                │
+                    │        ReadFromUDP (single receiver goroutine)    │
+                    └──────────┬───────────────────────────────────────┘
+                               │
+                    ┌──────────▼─────────────────────┐
+                    │     Receiver Goroutine          │
+                    │  ReadFromUDP → parse → msgChan  │
+                    │  (buffer = 2 × targetTPS)       │
+                    └──────────┬─────────────────────┘
+                               │
+                    ┌──────────▼──────────────────────┐
+                    │   Response Handler Goroutine     │
+                    │  msgChan → tracker.Resolve()     │
+                    │  (64-shard map by seq num)       │
+                    └──────────────────────────────────┘
+```
+
+**Performance optimizations:**
+
+| Component | Technique | Impact |
+|-----------|-----------|--------|
+| UDP Send | Removed mutex (UDPConn is goroutine-safe) | Allows parallel writes |
+| Receiver | `sync.Pool` buffers, dynamic channel size | Reduces GC, prevents overflow |
+| Stats | `sync/atomic` counters, fixed-bucket histogram | Lock-free, constant memory |
+| Transactions | 64-shard map | 64× less contention |
+| IP Pool | `[]uint32` free-list stack | O(1) alloc/release, no strings |
+| SEID Alloc | `atomic.Uint64` counter + free-list | Lock-free fast path |
+| Rate Limiter | Batch ticker (50 tokens/ms at 50K TPS) | Reliable at high rates |
+| Sequence Counter | `atomic.Uint32` | Lock-free |
+
+**Resource budget (50K TPS, 10K sessions):**
+
+| Resource | Value |
+|----------|-------|
+| Goroutines | ~10,005 |
+| Memory (sessions) | ~2 MB |
+| Memory (stats) | < 1 KB |
+| Memory (total steady-state) | ~100 MB |
+| Network bandwidth (out) | ~10 MB/s |
+| UDP syscalls | ~100K/sec |
+
 ---
 
 ## 4. Directory Structure
@@ -84,43 +160,47 @@ The PFCP Message Generator is a Go application that emulates an SMF node by repl
 pfcp-generator/
 ├── cmd/
 │   └── pfcp-generator/
-│       └── main.go                    # CLI entry point, cobra root command
+│       └── main.go                    # CLI entry point (normal + stress mode dispatch)
 ├── internal/
 │   ├── config/
-│   │   ├── config.go                  # Configuration struct and YAML/CLI loader
+│   │   ├── config.go                  # Configuration struct incl. StressConfig
 │   │   └── validator.go               # Config validation rules
 │   ├── pcap/
-│   │   ├── parser.go                  # PCAP file reader (gopacket)
-│   │   └── filter.go                  # PFCP packet filter (UDP 8805, requests only)
+│   │   └── parser.go                  # PCAP file reader (pcapgo, defrag, SLL fix)
 │   ├── pfcp/
 │   │   ├── decoder.go                 # wmnsk/go-pfcp wrapper for decoding raw bytes
 │   │   ├── encoder.go                 # wmnsk/go-pfcp wrapper for encoding messages
 │   │   ├── modifier.go               # IE modification logic (F-SEID, UE IP, header)
 │   │   └── message_types.go          # Message type helpers and constants
 │   ├── session/
-│   │   ├── manager.go                 # Session lifecycle management & mapping
-│   │   ├── seid_allocator.go          # SEID allocation strategies
-│   │   └── ip_pool.go                # UE IP address pool (IPv4/IPv6)
+│   │   ├── manager.go                 # Session lifecycle: Replay + ReplayStress
+│   │   ├── grouper.go                 # Groups pcap messages into SessionTemplates
+│   │   ├── ratelimiter.go            # Batch-ticker rate limiter for high TPS
+│   │   ├── seid_allocator.go          # Atomic counter + free-list SEID allocation
+│   │   └── ip_pool.go                # Free-list stack UE IP allocation
 │   ├── network/
-│   │   ├── sender.go                  # UDP client to UPF
-│   │   ├── receiver.go               # Async response handler
-│   │   └── transaction.go            # Transaction tracking (seq# matching, timeouts)
+│   │   ├── sender.go                  # Lock-free UDP client
+│   │   ├── receiver.go               # Async receiver with sync.Pool buffers
+│   │   └── transaction.go            # 64-shard transaction tracker
 │   └── stats/
-│       ├── collector.go               # Statistics aggregation
-│       └── reporter.go               # Console/file statistics output
+│       ├── collector.go               # Atomic counters + fixed-bucket histogram
+│       └── reporter.go               # Console/JSON statistics output
 ├── pkg/
 │   └── types/
 │       └── types.go                   # Shared types (SessionInfo, PFCPMessage, etc.)
 ├── test/
-│   ├── testdata/
-│   │   └── sample.pcap               # Test PCAP files
-│   └── integration/
-│       └── mock_upf_test.go          # Mock UPF for integration tests
+│   ├── mockupf/
+│   │   └── main.go                   # High-performance mock UPF (sharded, multi-reader)
+│   └── testdata/
+│       ├── sample.pcap               # Test PCAP files
+│       └── stard_trace.pcap          # Single-session lifecycle (Est+3Mod+Del)
+├── dist/                              # Pre-built RHEL-compatible linux/amd64 binaries
 ├── docs/
 │   ├── requirements.md               # Requirements document
 │   ├── architecture.md               # This document
 │   └── implementation.md             # Implementation guide
 ├── config.yaml                        # Example configuration file
+├── Dockerfile                         # Multi-stage UBI 8.10 build
 ├── go.mod
 ├── go.sum
 ├── Makefile                           # Build, test, lint automation
@@ -427,6 +507,8 @@ type TransactionTracker interface {
 
 ## 9. Concurrency Model
 
+### 9.1 Replay Mode (Default)
+
 ```
 Main Goroutine
 │
@@ -440,19 +522,67 @@ Main Goroutine
 │   └── Listens on UDP socket, dispatches to Transaction Tracker
 │
 ├── Transaction Timeout Monitor Goroutine
-│   └── Periodically checks for timed-out transactions
+│   └── Periodically checks for timed-out transactions (64 shards)
 │
 └── Stats Reporter Goroutine (optional)
     └── Periodically prints statistics
 ```
 
-**Synchronization:**
-- SEID Allocator: `sync.Mutex`
-- UE IP Pool: `sync.Mutex`
-- Session Manager: `sync.RWMutex`
-- Transaction Tracker: `sync.Mutex`
-- Statistics Collector: `sync.Mutex` or atomic operations
-- All goroutines respect `context.Context` for shutdown
+### 9.2 Stress Test Mode
+
+```
+Main Goroutine
+│
+├── PCAP Parser (synchronous, startup only)
+│
+├── Session Grouper (startup only)
+│   └── Groups pcap messages into SessionTemplates via BuildReplayPlan()
+│
+├── Feeder Goroutine
+│   ├── Enqueues session templates round-robin onto workCh
+│   ├── Blocks on semaphore when active sessions reach cap (e.g., 10,000)
+│   └── Stops on context cancellation or duration timer
+│
+├── Worker Goroutines (N = ActiveSessions from config)
+│   ├── Consume templates from workCh
+│   ├── For each template message:
+│   │   ├── rate.Wait() — blocks until rate limiter grants a token
+│   │   ├── Modify message (SEID, UE IP, seq#)
+│   │   ├── Send via lock-free UDPConn.WriteToUDP()
+│   │   └── Wait for response via 64-shard transaction tracker
+│   └── Release semaphore slot on session completion
+│
+├── Rate Limiter Goroutine
+│   └── Batch ticker: produces batchSize tokens per tick (e.g., 50 tokens/ms at 50K TPS)
+│
+├── Receiver Goroutine
+│   ├── ReadFromUDP with sync.Pool buffer reuse
+│   └── Dispatches to msgChan (buffer = 2 × targetTPS)
+│
+├── Response Handler Goroutine
+│   └── Drains msgChan → tracker.Resolve() (sharded by seq num)
+│
+├── Transaction Timeout Monitor Goroutine
+│   └── Scans 64 shards for timed-out transactions
+│
+└── Progress Logger Goroutine
+    └── Prints TPS, active sessions, totals every 10 seconds
+```
+
+### 9.3 Synchronization
+
+| Component | Replay Mode | Stress Mode |
+|-----------|-------------|-------------|
+| SEID Allocator | `sync.Mutex` (free-list) | `atomic.Uint64` (fast path) + `sync.Mutex` (free-list reuse) |
+| UE IP Pool | `sync.Mutex` (free-list stack) | Same |
+| Session Manager | `sync.RWMutex` | Same |
+| Transaction Tracker | 64-shard `sync.Mutex` | Same |
+| Statistics Collector | `sync/atomic` counters | Same |
+| Response Times | Fixed-bucket histogram (`atomic.Uint64` per bucket) | Same |
+| Sequence Counter | `atomic.Uint32` with CAS | Same |
+| UDP Send | Lock-free (`UDPConn` is goroutine-safe) | Same |
+
+All goroutines respect `context.Context` for shutdown.
 
 ---
 

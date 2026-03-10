@@ -12,6 +12,8 @@ import (
 	"pfcp-generator/pkg/types"
 )
 
+const numShards = 64
+
 // PendingTransaction represents a request awaiting a response.
 type PendingTransaction struct {
 	SeqNum      uint32
@@ -21,10 +23,14 @@ type PendingTransaction struct {
 	ResultCh    chan types.TransactionResult
 }
 
-// TransactionTracker manages pending PFCP transactions.
+type txShard struct {
+	pending map[uint32]*PendingTransaction
+	mu      sync.Mutex
+}
+
+// TransactionTracker manages pending PFCP transactions using sharded maps.
 type TransactionTracker struct {
-	pending    map[uint32]*PendingTransaction
-	mu         sync.Mutex
+	shards     [numShards]txShard
 	timeout    time.Duration
 	maxRetries int
 	sender     *UDPClient
@@ -32,41 +38,51 @@ type TransactionTracker struct {
 
 // NewTransactionTracker creates a new transaction tracker.
 func NewTransactionTracker(sender *UDPClient, timeoutMs int, maxRetries int) *TransactionTracker {
-	return &TransactionTracker{
-		pending:    make(map[uint32]*PendingTransaction),
+	t := &TransactionTracker{
 		timeout:    time.Duration(timeoutMs) * time.Millisecond,
 		maxRetries: maxRetries,
 		sender:     sender,
 	}
+	for i := range t.shards {
+		t.shards[i].pending = make(map[uint32]*PendingTransaction)
+	}
+	return t
+}
+
+func (t *TransactionTracker) shard(seqNum uint32) *txShard {
+	return &t.shards[seqNum%numShards]
 }
 
 // Track registers a new pending transaction and returns a channel for the result.
 func (t *TransactionTracker) Track(seqNum uint32, requestData []byte) <-chan types.TransactionResult {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
+	s := t.shard(seqNum)
 	resultCh := make(chan types.TransactionResult, 1)
-	t.pending[seqNum] = &PendingTransaction{
+
+	s.mu.Lock()
+	s.pending[seqNum] = &PendingTransaction{
 		SeqNum:      seqNum,
 		RequestData: requestData,
 		SentAt:      time.Now(),
 		ResultCh:    resultCh,
 	}
+	s.mu.Unlock()
 
 	return resultCh
 }
 
 // Resolve matches a received response to a pending transaction.
 func (t *TransactionTracker) Resolve(seqNum uint32, response message.Message, responseData []byte) {
-	t.mu.Lock()
-	tx, exists := t.pending[seqNum]
+	s := t.shard(seqNum)
+
+	s.mu.Lock()
+	tx, exists := s.pending[seqNum]
 	if !exists {
-		t.mu.Unlock()
+		s.mu.Unlock()
 		log.WithField("seq_num", seqNum).Warn("Received response for unknown transaction")
 		return
 	}
-	delete(t.pending, seqNum)
-	t.mu.Unlock()
+	delete(s.pending, seqNum)
+	s.mu.Unlock()
 
 	responseTime := time.Since(tx.SentAt)
 	tx.ResultCh <- types.TransactionResult{
@@ -94,34 +110,37 @@ func (t *TransactionTracker) StartTimeoutMonitor(ctx context.Context) {
 }
 
 func (t *TransactionTracker) checkTimeouts() {
-	t.mu.Lock()
-	var timedOut []*PendingTransaction
 	now := time.Now()
-
-	for _, tx := range t.pending {
-		if now.Sub(tx.SentAt) > t.timeout {
-			timedOut = append(timedOut, tx)
+	for i := range t.shards {
+		s := &t.shards[i]
+		s.mu.Lock()
+		var timedOut []*PendingTransaction
+		for _, tx := range s.pending {
+			if now.Sub(tx.SentAt) > t.timeout {
+				timedOut = append(timedOut, tx)
+			}
 		}
-	}
-	t.mu.Unlock()
+		s.mu.Unlock()
 
-	for _, tx := range timedOut {
-		t.handleTimeout(tx)
+		for _, tx := range timedOut {
+			t.handleTimeout(tx)
+		}
 	}
 }
 
 func (t *TransactionTracker) handleTimeout(tx *PendingTransaction) {
-	t.mu.Lock()
+	s := t.shard(tx.SeqNum)
+	s.mu.Lock()
 	// Verify still pending (may have been resolved between check and handle)
-	if _, exists := t.pending[tx.SeqNum]; !exists {
-		t.mu.Unlock()
+	if _, exists := s.pending[tx.SeqNum]; !exists {
+		s.mu.Unlock()
 		return
 	}
 
 	if tx.RetryCount < t.maxRetries {
 		tx.RetryCount++
 		tx.SentAt = time.Now() // Reset timeout
-		t.mu.Unlock()
+		s.mu.Unlock()
 
 		log.WithFields(log.Fields{
 			"seq_num": tx.SeqNum,
@@ -133,8 +152,8 @@ func (t *TransactionTracker) handleTimeout(tx *PendingTransaction) {
 			log.WithError(err).WithField("seq_num", tx.SeqNum).Error("Retransmission failed")
 		}
 	} else {
-		delete(t.pending, tx.SeqNum)
-		t.mu.Unlock()
+		delete(s.pending, tx.SeqNum)
+		s.mu.Unlock()
 
 		log.WithFields(log.Fields{
 			"seq_num": tx.SeqNum,
@@ -148,23 +167,30 @@ func (t *TransactionTracker) handleTimeout(tx *PendingTransaction) {
 	}
 }
 
-// PendingCount returns the number of pending transactions.
+// PendingCount returns the number of pending transactions across all shards.
 func (t *TransactionTracker) PendingCount() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return len(t.pending)
+	total := 0
+	for i := range t.shards {
+		s := &t.shards[i]
+		s.mu.Lock()
+		total += len(s.pending)
+		s.mu.Unlock()
+	}
+	return total
 }
 
-// CancelAll cancels all pending transactions.
+// CancelAll cancels all pending transactions across all shards.
 func (t *TransactionTracker) CancelAll() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	for seqNum, tx := range t.pending {
-		tx.ResultCh <- types.TransactionResult{
-			SeqNum: seqNum,
-			Error:  fmt.Errorf("cancelled"),
+	for i := range t.shards {
+		s := &t.shards[i]
+		s.mu.Lock()
+		for seqNum, tx := range s.pending {
+			tx.ResultCh <- types.TransactionResult{
+				SeqNum: seqNum,
+				Error:  fmt.Errorf("cancelled"),
+			}
+			delete(s.pending, seqNum)
 		}
-		delete(t.pending, seqNum)
+		s.mu.Unlock()
 	}
 }

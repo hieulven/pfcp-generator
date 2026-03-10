@@ -14,17 +14,17 @@ import (
 
 // Reporter outputs statistics to console and/or file.
 type Reporter struct {
-	collector  *Collector
+	collector   *Collector
 	intervalSec int
-	exportFile string
+	exportFile  string
 }
 
 // NewReporter creates a new statistics reporter.
 func NewReporter(collector *Collector, intervalSec int, exportFile string) *Reporter {
 	return &Reporter{
-		collector:  collector,
+		collector:   collector,
 		intervalSec: intervalSec,
-		exportFile: exportFile,
+		exportFile:  exportFile,
 	}
 }
 
@@ -62,12 +62,12 @@ func (r *Reporter) ExportJSON() error {
 	}
 
 	snap := r.collector.Snapshot()
-	min, avg, max, p99 := snap.ResponseTimeStats()
+	elapsed := snap.Duration()
 
 	export := map[string]interface{}{
 		"start_time":   snap.StartTime.Format(time.RFC3339),
 		"end_time":     snap.EndTime.Format(time.RFC3339),
-		"duration_sec": snap.Duration().Seconds(),
+		"duration_sec": elapsed.Seconds(),
 		"messages":     map[string]interface{}{},
 		"sessions": map[string]interface{}{
 			"established": snap.SessionsEstablished,
@@ -77,15 +77,17 @@ func (r *Reporter) ExportJSON() error {
 			"active":      snap.ActiveSessions,
 		},
 		"response_times_ms": map[string]interface{}{
-			"min": float64(min) / float64(time.Millisecond),
-			"avg": float64(avg) / float64(time.Millisecond),
-			"max": float64(max) / float64(time.Millisecond),
-			"p99": float64(p99) / float64(time.Millisecond),
+			"min": float64(snap.RespMin) / float64(time.Millisecond),
+			"avg": float64(snap.RespAvg) / float64(time.Millisecond),
+			"max": float64(snap.RespMax) / float64(time.Millisecond),
+			"p50": float64(snap.RespP50) / float64(time.Millisecond),
+			"p95": float64(snap.RespP95) / float64(time.Millisecond),
+			"p99": float64(snap.RespP99) / float64(time.Millisecond),
 		},
 	}
 
 	totalSent := snap.TotalSent()
-	duration := snap.Duration().Seconds()
+	duration := elapsed.Seconds()
 	if duration > 0 {
 		export["throughput_msg_per_sec"] = float64(totalSent) / duration
 	}
@@ -119,7 +121,6 @@ func (r *Reporter) ExportJSON() error {
 func (r *Reporter) FormatReport() string {
 	snap := r.collector.Snapshot()
 	elapsed := snap.Duration()
-	min, avg, max, p99 := snap.ResponseTimeStats()
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("\n=== PFCP Generator Statistics (elapsed: %s) ===\n", elapsed.Round(time.Second)))
@@ -142,11 +143,11 @@ func (r *Reporter) FormatReport() string {
 	sb.WriteString(fmt.Sprintf("  Established: %d  |  Active: %d  |  Deleted: %d  |  Failed: %d\n",
 		snap.SessionsEstablished, snap.ActiveSessions, snap.SessionsDeleted, snap.SessionsFailed))
 
-	if len(snap.ResponseTimes) > 0 {
+	if snap.RespCount > 0 {
 		sb.WriteString("Response Times:\n")
 		sb.WriteString(fmt.Sprintf("  Min: %s  |  Avg: %s  |  Max: %s  |  P99: %s\n",
-			min.Round(time.Microsecond), avg.Round(time.Microsecond),
-			max.Round(time.Microsecond), p99.Round(time.Microsecond)))
+			snap.RespMin.Round(time.Microsecond), snap.RespAvg.Round(time.Microsecond),
+			snap.RespMax.Round(time.Microsecond), snap.RespP99.Round(time.Microsecond)))
 	}
 
 	totalSent := snap.TotalSent()

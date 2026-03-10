@@ -17,6 +17,7 @@ type Config struct {
 	Input       InputConfig       `yaml:"input"       mapstructure:"input"`
 	Logging     LoggingConfig     `yaml:"logging"     mapstructure:"logging"`
 	Stats       StatsConfig       `yaml:"stats"       mapstructure:"stats"`
+	Stress      StressConfig      `yaml:"stress"      mapstructure:"stress"`
 }
 
 type SMFConfig struct {
@@ -66,6 +67,14 @@ type StatsConfig struct {
 	ExportFile        string `yaml:"export_file"         mapstructure:"export_file"`
 }
 
+// StressConfig configures the high-performance stress test mode.
+type StressConfig struct {
+	Enabled        bool `yaml:"enabled"         mapstructure:"enabled"`
+	TPS            int  `yaml:"tps"             mapstructure:"tps"`
+	ActiveSessions int  `yaml:"active_sessions" mapstructure:"active_sessions"`
+	DurationSec    int  `yaml:"duration_sec"    mapstructure:"duration_sec"`
+}
+
 // SetDefaults configures default values for the configuration.
 func SetDefaults(v *viper.Viper) {
 	v.SetDefault("smf.port", 8805)
@@ -84,6 +93,10 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("logging.console", true)
 	v.SetDefault("stats.enabled", true)
 	v.SetDefault("stats.report_interval_sec", 10)
+	v.SetDefault("stress.enabled", false)
+	v.SetDefault("stress.tps", 50000)
+	v.SetDefault("stress.active_sessions", 10000)
+	v.SetDefault("stress.duration_sec", 0)
 }
 
 // Load reads configuration from a YAML file and returns a Config.
@@ -126,16 +139,27 @@ func (c *Config) Summary() string {
 	sb.WriteString(fmt.Sprintf("  UE Pool:       %s\n", c.Session.UEIPPool))
 	sb.WriteString(fmt.Sprintf("  Strip IPv6:    %v\n", c.Session.StripIPv6))
 	sb.WriteString(fmt.Sprintf("  SEID Start:    %d (%s)\n", c.Session.SEIDStart, c.Session.SEIDStrategy))
-	sb.WriteString(fmt.Sprintf("  Msg Interval:  %dms\n", c.Timing.MessageIntervalMs))
+	if c.Stress.Enabled {
+		sb.WriteString("  Mode:          STRESS TEST\n")
+		sb.WriteString(fmt.Sprintf("  Target TPS:    %d\n", c.Stress.TPS))
+		sb.WriteString(fmt.Sprintf("  Active Sess:   %d\n", c.Stress.ActiveSessions))
+		if c.Stress.DurationSec > 0 {
+			sb.WriteString(fmt.Sprintf("  Duration:      %ds\n", c.Stress.DurationSec))
+		} else {
+			sb.WriteString("  Duration:      unlimited (Ctrl+C to stop)\n")
+		}
+	} else {
+		sb.WriteString(fmt.Sprintf("  Msg Interval:  %dms\n", c.Timing.MessageIntervalMs))
+		if c.Input.RepeatCount == 0 {
+			sb.WriteString("  Repeat:        infinite\n")
+		} else {
+			sb.WriteString(fmt.Sprintf("  Repeat:        %d time(s)\n", c.Input.RepeatCount))
+		}
+		if c.Timing.RepeatIntervalMs > 0 {
+			sb.WriteString(fmt.Sprintf("  Repeat Delay:  %dms\n", c.Timing.RepeatIntervalMs))
+		}
+	}
 	sb.WriteString(fmt.Sprintf("  Timeout:       %dms (retries: %d)\n", c.Timing.ResponseTimeoutMs, c.Timing.MaxRetries))
 	sb.WriteString(fmt.Sprintf("  Cleanup:       %v\n", c.Session.CleanupOnExit))
-	if c.Input.RepeatCount == 0 {
-		sb.WriteString("  Repeat:        infinite\n")
-	} else {
-		sb.WriteString(fmt.Sprintf("  Repeat:        %d time(s)\n", c.Input.RepeatCount))
-	}
-	if c.Timing.RepeatIntervalMs > 0 {
-		sb.WriteString(fmt.Sprintf("  Repeat Delay:  %dms\n", c.Timing.RepeatIntervalMs))
-	}
 	return sb.String()
 }

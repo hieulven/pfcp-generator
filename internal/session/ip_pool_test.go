@@ -48,9 +48,8 @@ func TestUEIPPool_Allocate_SkipsNetworkAddress(t *testing.T) {
 }
 
 func TestUEIPPool_Exhaustion(t *testing.T) {
-	// /30 gives 4 addresses: .0 (net), .1, .2, .3 (broadcast)
-	// Only .1 and .2 are usable, but our pool doesn't skip broadcast
-	// so it allocates .1, .2, .3 then wraps and fails
+	// /30 gives 4 addresses: .0 (net), .1, .2, .3
+	// Usable: .1, .2, .3 (3 addresses, network address skipped)
 	pool, err := NewUEIPPool("10.60.0.0/30")
 	require.NoError(t, err)
 
@@ -66,7 +65,7 @@ func TestUEIPPool_Exhaustion(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "10.60.0.3", ip3.String())
 
-	// Pool should be exhausted now (next would be .4 which is outside /30)
+	// Pool should be exhausted now
 	_, err = pool.Allocate()
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "exhausted")
@@ -103,12 +102,12 @@ func TestUEIPPool_Available_Count(t *testing.T) {
 	pool, err := NewUEIPPool("10.60.0.0/24")
 	require.NoError(t, err)
 
-	// /24 = 256 total, minus network and broadcast = 254
-	assert.Equal(t, 254, pool.Available())
+	// /24 = 256 total, minus network = 255 usable
+	assert.Equal(t, 255, pool.Available())
 
 	_, err = pool.Allocate()
 	require.NoError(t, err)
-	assert.Equal(t, 253, pool.Available())
+	assert.Equal(t, 254, pool.Available())
 }
 
 func TestUEIPPool_ConcurrentAccess(t *testing.T) {

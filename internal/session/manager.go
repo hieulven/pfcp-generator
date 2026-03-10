@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -42,19 +43,20 @@ type Manager struct {
 
 // SequenceCounter manages PFCP sequence numbers.
 type SequenceCounter struct {
-	current uint32
-	mu      sync.Mutex
+	current atomic.Uint32
 }
 
 // Next returns the next sequence number (24-bit, wraps at 0xFFFFFF).
 func (s *SequenceCounter) Next() uint32 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.current++
-	if s.current > 0xFFFFFF {
-		s.current = 1
+	for {
+		cur := s.current.Add(1)
+		val := cur & 0xFFFFFF
+		if val == 0 {
+			// Wrapped to 0, skip to 1
+			continue
+		}
+		return val
 	}
-	return s.current
 }
 
 // NewManager creates a new session manager.
@@ -128,7 +130,7 @@ func (m *Manager) Reset() {
 	m.byLocalSEID = make(map[uint64]*types.SessionInfo)
 }
 
-// Replay processes all PFCP messages from the pcap in order.
+// Replay processes all PFCP messages from the pcap in order (sequential mode).
 func (m *Manager) Replay(ctx context.Context, messages []types.RawPFCPMessage) error {
 	interval := time.Duration(m.cfg.Timing.MessageIntervalMs) * time.Millisecond
 
@@ -163,6 +165,152 @@ func (m *Manager) Replay(ctx context.Context, messages []types.RawPFCPMessage) e
 		}
 	}
 
+	return nil
+}
+
+// ReplayStress runs a high-performance stress test using the given replay plan.
+// It maintains up to activeSessions concurrent sessions, rate-limited to tps transactions/sec,
+// for the given duration. Workers cycle through session templates continuously.
+func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float64, activeSessions int, duration time.Duration) error {
+	// Send association setup once if present
+	if plan.AssociationSetup != nil && m.cfg.Association.Enabled {
+		msg, err := pfcp.Decode(plan.AssociationSetup.Data)
+		if err != nil {
+			return fmt.Errorf("failed to decode association setup: %w", err)
+		}
+		if err := m.handleAssociationSetup(ctx, msg); err != nil {
+			return fmt.Errorf("association setup failed: %w", err)
+		}
+	}
+
+	// Create rate limiter
+	rateLimiter := NewRateLimiter(ctx, tps)
+	defer rateLimiter.Stop()
+
+	// Session semaphore: limits concurrent active sessions
+	sem := make(chan struct{}, activeSessions)
+
+	// Work channel: carries template indices for workers
+	workCh := make(chan int, activeSessions)
+
+	// Timer for test duration
+	var testCtx context.Context
+	var testCancel context.CancelFunc
+	if duration > 0 {
+		testCtx, testCancel = context.WithTimeout(ctx, duration)
+	} else {
+		testCtx, testCancel = context.WithCancel(ctx)
+	}
+	defer testCancel()
+
+	// Track completed sessions for logging
+	var completedSessions atomic.Uint64
+	var failedSessions atomic.Uint64
+
+	// Feeder goroutine: continuously enqueues template indices round-robin
+	go func() {
+		defer close(workCh)
+		templateCount := len(plan.Templates)
+		idx := 0
+		for {
+			select {
+			case <-testCtx.Done():
+				return
+			case sem <- struct{}{}: // Acquire semaphore slot
+				select {
+				case workCh <- idx % templateCount:
+					idx++
+				case <-testCtx.Done():
+					<-sem // Release on cancel
+					return
+				}
+			}
+		}
+	}()
+
+	// Start worker goroutines
+	numWorkers := activeSessions
+	if numWorkers > 10000 {
+		numWorkers = 10000
+	}
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		go func() {
+			defer wg.Done()
+			for tmplIdx := range workCh {
+				tmpl := &plan.Templates[tmplIdx]
+				err := m.executeSessionTemplate(testCtx, tmpl, rateLimiter)
+				if err != nil {
+					if testCtx.Err() != nil {
+						<-sem // Release semaphore
+						return
+					}
+					failedSessions.Add(1)
+					log.WithError(err).Debug("Session template execution failed")
+				} else {
+					completedSessions.Add(1)
+				}
+				<-sem // Release semaphore slot
+			}
+		}()
+	}
+
+	// Periodic progress logging
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-testCtx.Done():
+				return
+			case <-ticker.C:
+				elapsed := m.stats.Duration()
+				totalSent := m.stats.TotalSent()
+				currentTPS := float64(0)
+				if elapsed.Seconds() > 0 {
+					currentTPS = float64(totalSent) / elapsed.Seconds()
+				}
+				log.WithFields(log.Fields{
+					"completed":  completedSessions.Load(),
+					"failed":     failedSessions.Load(),
+					"active":     m.stats.ActiveSessions.Load(),
+					"total_sent": totalSent,
+					"current_tps": fmt.Sprintf("%.0f", currentTPS),
+					"target_tps":  fmt.Sprintf("%.0f", tps),
+					"elapsed":    elapsed.Round(time.Second),
+				}).Info("Stress test progress")
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	log.WithFields(log.Fields{
+		"completed": completedSessions.Load(),
+		"failed":    failedSessions.Load(),
+	}).Info("Stress test completed")
+
+	return nil
+}
+
+// executeSessionTemplate runs a single session lifecycle (Est + Mods + Del).
+func (m *Manager) executeSessionTemplate(ctx context.Context, tmpl *SessionTemplate, rateLimiter *RateLimiter) error {
+	for _, raw := range tmpl.Messages {
+		if err := rateLimiter.Wait(ctx); err != nil {
+			return err
+		}
+
+		msg, err := pfcp.Decode(raw.Data)
+		if err != nil {
+			return fmt.Errorf("failed to decode message: %w", err)
+		}
+
+		if err := m.processMessage(ctx, msg, raw); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -265,7 +413,7 @@ func (m *Manager) handleSessionEstablishment(ctx context.Context, msg message.Me
 		LocalSEID:      localSEID,
 		UEIP:           ueIP,
 		State:          "establishing",
-		CreatedAt:       time.Now(),
+		CreatedAt:      time.Now(),
 	}
 
 	// Store mapping
@@ -303,7 +451,7 @@ func (m *Manager) handleSessionEstablishment(ctx context.Context, msg message.Me
 		"local_seid": localSEID,
 		"ue_ip":      ueIP,
 		"orig_seid":  originalCPSEID,
-	}).Info("Sent Session Establishment Request")
+	}).Debug("Sent Session Establishment Request")
 
 	// Wait for response
 	result := m.waitForResult(ctx, resultCh)
@@ -365,7 +513,7 @@ func (m *Manager) handleSessionEstablishment(ctx context.Context, msg message.Me
 		"remote_seid":   remoteSEID,
 		"ue_ip":         ueIP,
 		"response_time": result.ResponseTime.Round(time.Microsecond),
-	}).Info("Session established")
+	}).Debug("Session established")
 
 	return nil
 }
@@ -407,7 +555,7 @@ func (m *Manager) handleSessionModification(ctx context.Context, msg message.Mes
 		"seq_num":     seqNum,
 		"remote_seid": session.RemoteSEID,
 		"local_seid":  session.LocalSEID,
-	}).Info("Sent Session Modification Request")
+	}).Debug("Sent Session Modification Request")
 
 	result := m.waitForResult(ctx, resultCh)
 	if result.Error != nil {
@@ -422,7 +570,7 @@ func (m *Manager) handleSessionModification(ctx context.Context, msg message.Mes
 	log.WithFields(log.Fields{
 		"seq_num":       seqNum,
 		"response_time": result.ResponseTime.Round(time.Microsecond),
-	}).Info("Session modified")
+	}).Debug("Session modified")
 
 	return nil
 }
@@ -463,7 +611,7 @@ func (m *Manager) handleSessionDeletion(ctx context.Context, msg message.Message
 		"seq_num":     seqNum,
 		"remote_seid": session.RemoteSEID,
 		"local_seid":  session.LocalSEID,
-	}).Info("Sent Session Deletion Request")
+	}).Debug("Sent Session Deletion Request")
 
 	result := m.waitForResult(ctx, resultCh)
 	if result.Error != nil {
@@ -483,13 +631,18 @@ func (m *Manager) handleSessionDeletion(ctx context.Context, msg message.Message
 
 	m.mu.Lock()
 	session.State = "deleted"
+	delete(m.byLocalSEID, session.LocalSEID)
+	delete(m.byOriginalCPSEID, session.OriginalCPSEID)
+	if session.OriginalRemoteSEID != 0 {
+		delete(m.byOriginalRemoteSEID, session.OriginalRemoteSEID)
+	}
 	m.mu.Unlock()
 
 	log.WithFields(log.Fields{
 		"seq_num":       seqNum,
 		"local_seid":    session.LocalSEID,
 		"response_time": result.ResponseTime.Round(time.Microsecond),
-	}).Info("Session deleted")
+	}).Debug("Session deleted")
 
 	return nil
 }

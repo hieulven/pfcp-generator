@@ -71,6 +71,19 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Sprintf("logging.level must be one of debug/info/warn/error, got %q", c.Logging.Level))
 	}
 
+	// Stress test validation
+	if c.Stress.Enabled {
+		if c.Stress.TPS <= 0 {
+			errs = append(errs, "stress.tps must be > 0")
+		}
+		if c.Stress.ActiveSessions <= 0 {
+			errs = append(errs, "stress.active_sessions must be > 0")
+		}
+		if c.Stress.DurationSec < 0 {
+			errs = append(errs, "stress.duration_sec must be >= 0")
+		}
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("configuration errors:\n  - %s", strings.Join(errs, "\n  - "))
 	}

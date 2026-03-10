@@ -87,7 +87,39 @@ docker run --rm --network host \
 
 ## Modes of Operation
 
-### 1. Replay Mode (default)
+### 1. Stress Test Mode
+
+High-performance mode for load/stress testing a UPF. Sessions are created from pcap templates and cycled continuously with configurable TPS and concurrency.
+
+```bash
+pfcp-generator \
+  --pcap capture.pcap \
+  --smf-ip 192.168.1.10 \
+  --upf-ip 192.168.1.20 \
+  --ue-pool 10.60.0.0/8 \
+  --stress --tps 50000 --active-sessions 10000 --duration 3600
+```
+
+**Target capabilities:**
+
+| Parameter | Target |
+|-----------|--------|
+| Transactions/sec | 50,000 |
+| Active PDU sessions | 10,000 |
+| Test duration | 10+ hours continuous |
+| Steady-state memory | ~100 MB |
+
+The tool groups pcap messages into session templates (Establishment + Modifications + Deletion), then dispatches them across a worker pool. A rate limiter controls TPS, and a semaphore caps concurrent active sessions.
+
+**Architecture highlights:**
+- Lock-free UDP writes (Go's `UDPConn` is goroutine-safe)
+- 64-shard transaction tracker to reduce lock contention
+- Atomic counters + fixed-bucket histogram for stats (constant memory)
+- `sync.Pool` for receive buffer reuse
+- Batch-ticker rate limiter (50 tokens/ms at 50K TPS)
+- Free-list based IP pool and SEID allocator (O(1) allocate/release)
+
+### 2. Replay Mode (default)
 
 Parses the pcap, modifies each PFCP request with new identifiers, sends them to the target UPF, and waits for responses.
 
@@ -169,6 +201,10 @@ The tool reads from a YAML config file (default `config.yaml`) and/or CLI flags.
 | `--cleanup` | `false` | Delete all active sessions on exit |
 | `--dry-run` | `false` | Parse only, no network traffic |
 | `--stats-only` | `false` | Print pcap message counts and exit |
+| `--stress` | `false` | Enable high-performance stress test mode |
+| `--tps` | `50000` | Target transactions per second (stress mode) |
+| `--active-sessions` | `10000` | Max concurrent active sessions (stress mode) |
+| `--duration` | `0` | Test duration in seconds (stress mode, 0=unlimited) |
 
 ### Config File
 
@@ -211,6 +247,13 @@ stats:
   enabled: true
   report_interval_sec: 10
   export_file: ""
+
+# Stress test mode (overrides timing/repeat settings)
+stress:
+  enabled: false
+  tps: 50000              # Target transactions per second
+  active_sessions: 10000  # Max concurrent active sessions
+  duration_sec: 0         # Test duration (0 = unlimited)
 ```
 
 ## Feature Details
@@ -317,13 +360,23 @@ This creates `test/testdata/sample.pcap` containing 14 packets (association, 3 e
 cmd/pfcp-generator/    CLI entry point
 internal/
   config/              Configuration loading and validation
-  network/             UDP client, receiver, transaction tracker
+  network/
+    sender.go          Lock-free UDP client
+    receiver.go        Async receiver with sync.Pool buffers
+    transaction.go     64-shard transaction tracker
   pcap/                Pcap parsing with SEID mapping extraction
   pfcp/                PFCP encode/decode/modify
-  session/             Session manager, SEID allocator, UE IP pool
-  stats/               Statistics collection and reporting
+  session/
+    manager.go         Session orchestration (Replay + ReplayStress)
+    grouper.go         Groups pcap messages into session templates
+    ratelimiter.go     Batch-ticker rate limiter for high TPS
+    ip_pool.go         Free-list based UE IP allocation
+    seid_allocator.go  Atomic counter + free-list SEID allocation
+  stats/
+    collector.go       Atomic counters + fixed-bucket histogram
+    reporter.go        Console and JSON reporting
 pkg/types/             Shared data types
 test/
-  mockupf/             Standalone mock UPF server
+  mockupf/             High-performance mock UPF (sharded, multi-reader)
   testdata/            Sample pcap and generation script
 ```

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,21 +27,25 @@ type session struct {
 	upSEID uint64
 }
 
+const numShards = 64
+
+type sessionShard struct {
+	mu       sync.Mutex
+	sessions map[uint64]*session // UP SEID → session
+}
+
 type mockUPF struct {
 	addr       string
 	conn       *net.UDPConn
 	localIP    net.IP
 	recoveryTS time.Time
 
-	mu         sync.Mutex
-	sessions   map[uint64]*session // UP SEID → session
-	nextUPSEID uint64
+	shards     [numShards]sessionShard
+	nextUPSEID atomic.Uint64
 
-	stats struct {
-		received int
-		sent     int
-		errors   int
-	}
+	received atomic.Uint64
+	sent     atomic.Uint64
+	errors   atomic.Uint64
 }
 
 func newMockUPF(addr string) *mockUPF {
@@ -48,27 +53,56 @@ func newMockUPF(addr string) *mockUPF {
 	if err != nil {
 		host = "127.0.0.1"
 	}
-	return &mockUPF{
+	u := &mockUPF{
 		addr:       addr,
 		localIP:    net.ParseIP(host),
 		recoveryTS: time.Now(),
-		sessions:   make(map[uint64]*session),
-		nextUPSEID: 1,
 	}
+	u.nextUPSEID.Store(1)
+	for i := range u.shards {
+		u.shards[i].sessions = make(map[uint64]*session)
+	}
+	return u
+}
+
+func (u *mockUPF) shard(upSEID uint64) *sessionShard {
+	return &u.shards[upSEID%numShards]
 }
 
 func (u *mockUPF) allocateUPSEID() uint64 {
-	seid := u.nextUPSEID
-	u.nextUPSEID++
-	return seid
+	return u.nextUPSEID.Add(1) - 1
+}
+
+func (u *mockUPF) storeSession(upSEID, cpSEID uint64) {
+	s := u.shard(upSEID)
+	s.mu.Lock()
+	s.sessions[upSEID] = &session{cpSEID: cpSEID, upSEID: upSEID}
+	s.mu.Unlock()
 }
 
 func (u *mockUPF) lookupCPSEID(upSEID uint64) (uint64, bool) {
-	s, ok := u.sessions[upSEID]
+	s := u.shard(upSEID)
+	s.mu.Lock()
+	sess, ok := s.sessions[upSEID]
+	s.mu.Unlock()
 	if !ok {
 		return 0, false
 	}
-	return s.cpSEID, true
+	return sess.cpSEID, true
+}
+
+func (u *mockUPF) deleteSession(upSEID uint64) (uint64, bool) {
+	s := u.shard(upSEID)
+	s.mu.Lock()
+	sess, ok := s.sessions[upSEID]
+	if ok {
+		delete(s.sessions, upSEID)
+	}
+	s.mu.Unlock()
+	if !ok {
+		return 0, false
+	}
+	return sess.cpSEID, true
 }
 
 func (u *mockUPF) run() error {
@@ -85,42 +119,50 @@ func (u *mockUPF) run() error {
 
 	log.Printf("Mock UPF listening on %s", u.addr)
 
+	// Use multiple reader goroutines for higher throughput
+	numReaders := 4
+	for i := 0; i < numReaders; i++ {
+		go u.readLoop()
+	}
+
+	// Block on signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+	log.Println("Shutting down...")
+	u.printStats()
+	return u.conn.Close()
+}
+
+func (u *mockUPF) readLoop() {
 	buf := make([]byte, 65535)
 	for {
 		n, remoteAddr, err := u.conn.ReadFromUDP(buf)
 		if err != nil {
-			// Check if connection was closed (shutdown)
 			if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
-				return nil
+				return
 			}
-			log.Printf("read error: %v", err)
 			continue
 		}
 
-		u.mu.Lock()
-		u.stats.received++
-		u.mu.Unlock()
+		u.received.Add(1)
 
-		resp, err := u.handleMessage(buf[:n])
+		// Copy data for processing (buf is reused)
+		data := make([]byte, n)
+		copy(data, buf[:n])
+
+		resp, err := u.handleMessage(data)
 		if err != nil {
-			log.Printf("handle error: %v", err)
-			u.mu.Lock()
-			u.stats.errors++
-			u.mu.Unlock()
+			u.errors.Add(1)
 			continue
 		}
 
 		if resp != nil {
 			if _, err := u.conn.WriteToUDP(resp, remoteAddr); err != nil {
-				log.Printf("write error: %v", err)
-				u.mu.Lock()
-				u.stats.errors++
-				u.mu.Unlock()
+				u.errors.Add(1)
 				continue
 			}
-			u.mu.Lock()
-			u.stats.sent++
-			u.mu.Unlock()
+			u.sent.Add(1)
 		}
 	}
 }
@@ -186,13 +228,9 @@ func (u *mockUPF) handleAssociationSetup(req *message.AssociationSetupRequest) m
 
 func (u *mockUPF) handleHeartbeat(req *message.HeartbeatRequest) message.Message {
 	seq := req.Sequence()
-	log.Printf("← HeartbeatRequest seq=%d", seq)
-
 	resp := message.NewHeartbeatResponse(seq,
 		ie.NewRecoveryTimeStamp(u.recoveryTS),
 	)
-
-	log.Printf("→ HeartbeatResponse seq=%d", seq)
 	return resp
 }
 
@@ -209,12 +247,8 @@ func (u *mockUPF) handleSessionEstablishment(req *message.SessionEstablishmentRe
 	}
 	cpSEID := fseid.SEID
 
-	u.mu.Lock()
 	upSEID := u.allocateUPSEID()
-	u.sessions[upSEID] = &session{cpSEID: cpSEID, upSEID: upSEID}
-	u.mu.Unlock()
-
-	log.Printf("← SessionEstablishmentRequest seq=%d cpSEID=%d", seq, cpSEID)
+	u.storeSession(upSEID, cpSEID)
 
 	resp := message.NewSessionEstablishmentResponse(
 		0, 0,
@@ -226,7 +260,6 @@ func (u *mockUPF) handleSessionEstablishment(req *message.SessionEstablishmentRe
 		ie.NewFSEID(upSEID, u.localIP, nil), // body F-SEID = UP SEID
 	)
 
-	log.Printf("→ SessionEstablishmentResponse seq=%d upSEID=%d → cpSEID=%d", seq, upSEID, cpSEID)
 	return resp, nil
 }
 
@@ -234,15 +267,10 @@ func (u *mockUPF) handleSessionModification(req *message.SessionModificationRequ
 	seq := req.Sequence()
 	upSEID := req.SEID() // UP SEID is in the header
 
-	u.mu.Lock()
 	cpSEID, ok := u.lookupCPSEID(upSEID)
-	u.mu.Unlock()
-
 	if !ok {
 		return nil, fmt.Errorf("unknown UP SEID %d in modification request", upSEID)
 	}
-
-	log.Printf("← SessionModificationRequest seq=%d upSEID=%d", seq, upSEID)
 
 	resp := message.NewSessionModificationResponse(
 		0, 0,
@@ -252,7 +280,6 @@ func (u *mockUPF) handleSessionModification(req *message.SessionModificationRequ
 		ie.NewCause(ie.CauseRequestAccepted),
 	)
 
-	log.Printf("→ SessionModificationResponse seq=%d cpSEID=%d", seq, cpSEID)
 	return resp, nil
 }
 
@@ -260,18 +287,10 @@ func (u *mockUPF) handleSessionDeletion(req *message.SessionDeletionRequest) (me
 	seq := req.Sequence()
 	upSEID := req.SEID() // UP SEID is in the header
 
-	u.mu.Lock()
-	cpSEID, ok := u.lookupCPSEID(upSEID)
-	if ok {
-		delete(u.sessions, upSEID)
-	}
-	u.mu.Unlock()
-
+	cpSEID, ok := u.deleteSession(upSEID)
 	if !ok {
 		return nil, fmt.Errorf("unknown UP SEID %d in deletion request", upSEID)
 	}
-
-	log.Printf("← SessionDeletionRequest seq=%d upSEID=%d", seq, upSEID)
 
 	resp := message.NewSessionDeletionResponse(
 		0, 0,
@@ -281,15 +300,12 @@ func (u *mockUPF) handleSessionDeletion(req *message.SessionDeletionRequest) (me
 		ie.NewCause(ie.CauseRequestAccepted),
 	)
 
-	log.Printf("→ SessionDeletionResponse seq=%d cpSEID=%d (session removed)", seq, cpSEID)
 	return resp, nil
 }
 
 func (u *mockUPF) printStats() {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	log.Printf("Stats: received=%d sent=%d errors=%d activeSessions=%d",
-		u.stats.received, u.stats.sent, u.stats.errors, len(u.sessions))
+	log.Printf("Stats: received=%d sent=%d errors=%d",
+		u.received.Load(), u.sent.Load(), u.errors.Load())
 }
 
 func main() {
@@ -298,15 +314,13 @@ func main() {
 
 	upf := newMockUPF(*addr)
 
-	// Handle graceful shutdown
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
+	// Periodic stats logging
 	go func() {
-		<-sigCh
-		log.Println("Shutting down...")
-		upf.printStats()
-		upf.conn.Close()
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			upf.printStats()
+		}
 	}()
 
 	if err := upf.run(); err != nil {

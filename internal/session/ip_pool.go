@@ -1,16 +1,20 @@
 package session
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
 )
 
 // UEIPPool manages allocation of UE IP addresses from a CIDR range.
+// Uses a free-list stack for O(1) allocation and release, with uint32 offsets
+// instead of string-keyed maps.
 type UEIPPool struct {
-	cidr      *net.IPNet
-	nextIP    net.IP
-	allocated map[string]bool
+	baseIP    uint32   // network address as uint32
+	freeList  []uint32 // stack of available IP offsets
+	allocated []bool   // tracks which offsets are in use
+	totalIPs  int      // total usable IPs (excluding network address)
 	mu        sync.Mutex
 }
 
@@ -21,100 +25,90 @@ func NewUEIPPool(cidr string) (*UEIPPool, error) {
 		return nil, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
 	}
 
-	// Start from first usable address (network address + 1)
-	firstIP := make(net.IP, len(ipnet.IP))
-	copy(firstIP, ipnet.IP)
-	incrementIP(firstIP)
+	ip4 := ipnet.IP.To4()
+	if ip4 == nil {
+		return nil, fmt.Errorf("only IPv4 CIDR is supported, got %q", cidr)
+	}
+
+	baseIP := binary.BigEndian.Uint32(ip4)
+	ones, bits := ipnet.Mask.Size()
+	totalAddrs := 1 << (bits - ones)
+
+	// Skip network address (.0), so usable = totalAddrs - 1
+	usable := totalAddrs - 1
+	if usable <= 0 {
+		usable = 1
+	}
+
+	// Pre-populate free list in reverse order so that offset 1 (.1) is at top of stack
+	freeList := make([]uint32, usable)
+	for i := 0; i < usable; i++ {
+		freeList[i] = uint32(usable - i) // [usable, usable-1, ..., 2, 1]
+	}
+
+	// Tracking array: offset 0 unused (network addr), offsets 1..usable
+	allocated := make([]bool, usable+1)
 
 	return &UEIPPool{
-		cidr:      ipnet,
-		nextIP:    firstIP,
-		allocated: make(map[string]bool),
+		baseIP:    baseIP,
+		freeList:  freeList,
+		allocated: allocated,
+		totalIPs:  usable,
 	}, nil
 }
 
-// Allocate returns the next available IP address from the pool.
+// Allocate returns the next available IP address from the pool. O(1).
 func (p *UEIPPool) Allocate() (net.IP, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// Ensure nextIP is within CIDR before starting
-	if !p.cidr.Contains(p.nextIP) {
-		copy(p.nextIP, p.cidr.IP)
-		incrementIP(p.nextIP)
+	if len(p.freeList) == 0 {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("UE IP pool exhausted (all %d addresses allocated)", p.totalIPs)
 	}
+	offset := p.freeList[len(p.freeList)-1]
+	p.freeList = p.freeList[:len(p.freeList)-1]
+	p.allocated[offset] = true
+	p.mu.Unlock()
 
-	startIP := make(net.IP, len(p.nextIP))
-	copy(startIP, p.nextIP)
-	checked := 0
-
-	// Calculate total usable IPs in the CIDR
-	ones, bits := p.cidr.Mask.Size()
-	totalIPs := 1 << (bits - ones)
-
-	for {
-		ipStr := p.nextIP.String()
-		if !p.allocated[ipStr] {
-			p.allocated[ipStr] = true
-			result := make(net.IP, len(p.nextIP))
-			copy(result, p.nextIP)
-			incrementIP(p.nextIP)
-			// Wrap if needed for next call
-			if !p.cidr.Contains(p.nextIP) {
-				copy(p.nextIP, p.cidr.IP)
-				incrementIP(p.nextIP)
-			}
-			return result, nil
-		}
-
-		incrementIP(p.nextIP)
-		checked++
-
-		// Wrap around if we've gone past the end
-		if !p.cidr.Contains(p.nextIP) {
-			copy(p.nextIP, p.cidr.IP)
-			incrementIP(p.nextIP)
-		}
-
-		// If we've checked all IPs in the range, the pool is exhausted
-		if checked >= totalIPs-1 || p.nextIP.Equal(startIP) {
-			return nil, fmt.Errorf("UE IP pool exhausted (all %d addresses allocated)", len(p.allocated))
-		}
-	}
+	return uint32ToIP(p.baseIP + offset), nil
 }
 
-// Release frees a previously allocated IP address back to the pool.
+// Release frees a previously allocated IP address back to the pool. O(1).
 func (p *UEIPPool) Release(ip net.IP) {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return
+	}
+	ipVal := binary.BigEndian.Uint32(ip4)
+	if ipVal < p.baseIP {
+		return
+	}
+	offset := ipVal - p.baseIP
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	delete(p.allocated, ip.String())
+	// Only release if it was actually allocated
+	if int(offset) < len(p.allocated) && p.allocated[offset] {
+		p.allocated[offset] = false
+		p.freeList = append(p.freeList, uint32(offset))
+	}
+	p.mu.Unlock()
 }
 
 // AllocatedCount returns the number of currently allocated IPs.
 func (p *UEIPPool) AllocatedCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.allocated)
+	return p.totalIPs - len(p.freeList)
 }
 
-// Available returns the approximate number of available IPs.
+// Available returns the number of available IPs.
 func (p *UEIPPool) Available() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	ones, bits := p.cidr.Mask.Size()
-	total := 1 << (bits - ones)
-	avail := total - len(p.allocated) - 2 // subtract network and broadcast
-	if avail < 0 {
-		return 0
-	}
-	return avail
+	return len(p.freeList)
 }
 
-func incrementIP(ip net.IP) {
-	for i := len(ip) - 1; i >= 0; i-- {
-		ip[i]++
-		if ip[i] > 0 {
-			break
-		}
-	}
+func uint32ToIP(v uint32) net.IP {
+	ip := make(net.IP, 4)
+	binary.BigEndian.PutUint32(ip, v)
+	return ip
 }

@@ -1,14 +1,17 @@
 package pcap
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"net"
+	"os"
 	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/ip4defrag"
 	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
+	"github.com/google/gopacket/pcapgo"
 	log "github.com/sirupsen/logrus"
 	"github.com/wmnsk/go-pfcp/message"
 
@@ -22,6 +25,137 @@ type Parser struct{}
 // NewParser creates a new PCAP parser.
 func NewParser() *Parser {
 	return &Parser{}
+}
+
+// pcap magic numbers
+const (
+	pcapMagicLE   = 0xa1b2c3d4 // little-endian microseconds
+	pcapMagicBE   = 0xd4c3b2a1 // big-endian microseconds
+	pcapMagicNsLE = 0xa1b23c4d // little-endian nanoseconds
+	pcapMagicNsBE = 0x4d3cb2a1 // big-endian nanoseconds
+)
+
+// fixPcapData reads a pcap file and fixes common issues:
+// 1. Snaplen too small: if any packet's captured length exceeds the declared snaplen,
+//    the snaplen is increased. This handles pcap files captured on virtual interfaces
+//    (e.g., Linux cooked capture with GRO/GSO).
+// 2. Corrupt SLL headers: if the link type is Linux SLL (113) and a packet has an
+//    invalid address length (halen > 8), it is clamped to 8. The SLL v1 address field
+//    is always 8 bytes, so halen values larger than 8 cause gopacket to panic.
+func fixPcapData(data []byte) []byte {
+	if len(data) < 24 {
+		return data
+	}
+
+	magic := binary.LittleEndian.Uint32(data[0:4])
+
+	var bo binary.ByteOrder
+	switch magic {
+	case pcapMagicLE, pcapMagicNsLE:
+		bo = binary.LittleEndian
+	case pcapMagicBE, pcapMagicNsBE:
+		bo = binary.BigEndian
+	default:
+		// Not a pcap file (might be pcapng), return unchanged
+		return data
+	}
+
+	snaplen := bo.Uint32(data[16:20])
+	linkType := bo.Uint32(data[20:24])
+	isSLL := linkType == 113 // LINKTYPE_LINUX_SLL
+
+	// Scan packet records to find max captured length and detect SLL issues
+	var maxInclLen uint32
+	needsFix := false
+	offset := 24
+	for offset+16 <= len(data) {
+		inclLen := bo.Uint32(data[offset+8 : offset+12])
+		if inclLen > maxInclLen {
+			maxInclLen = inclLen
+		}
+		// Check for corrupt SLL halen (bytes 4-5 of packet data, big-endian)
+		pktDataStart := offset + 16
+		if isSLL && int(inclLen) >= 16 && pktDataStart+6 <= len(data) {
+			halen := binary.BigEndian.Uint16(data[pktDataStart+4 : pktDataStart+6])
+			if halen > 8 {
+				needsFix = true
+			}
+		}
+		offset += 16 + int(inclLen)
+	}
+
+	if maxInclLen > snaplen {
+		needsFix = true
+	}
+
+	if !needsFix {
+		return data
+	}
+
+	// Make a copy and apply fixes
+	fixed := make([]byte, len(data))
+	copy(fixed, data)
+
+	if maxInclLen > snaplen {
+		log.WithFields(log.Fields{
+			"old_snaplen":  snaplen,
+			"max_pkt_size": maxInclLen,
+			"new_snaplen":  maxInclLen,
+		}).Debug("Fixing pcap snaplen to accommodate large packets")
+		bo.PutUint32(fixed[16:20], maxInclLen)
+	}
+
+	// Fix corrupt SLL headers
+	if isSLL {
+		offset = 24
+		for offset+16 <= len(fixed) {
+			inclLen := bo.Uint32(fixed[offset+8 : offset+12])
+			pktDataStart := offset + 16
+			if int(inclLen) >= 16 && pktDataStart+6 <= len(fixed) {
+				halen := binary.BigEndian.Uint16(fixed[pktDataStart+4 : pktDataStart+6])
+				if halen > 8 {
+					log.WithFields(log.Fields{
+						"offset": pktDataStart,
+						"halen":  halen,
+					}).Debug("Fixing corrupt SLL address length")
+					binary.BigEndian.PutUint16(fixed[pktDataStart+4:pktDataStart+6], 8)
+				}
+			}
+			offset += 16 + int(inclLen)
+		}
+	}
+
+	return fixed
+}
+
+// openPcapFile reads a pcap/pcapng file and returns a PacketDataSource and link type.
+// It automatically fixes snaplen mismatches in pcap files.
+func openPcapFile(filename string) (gopacket.PacketDataSource, layers.LinkType, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to read pcap file %s: %w", filename, err)
+	}
+
+	data = fixPcapData(data)
+
+	// Try pcap format first
+	reader, err := pcapgo.NewReader(bytes.NewReader(data))
+	if err == nil {
+		linkType := reader.LinkType()
+		log.WithField("link_type", linkType.String()).Debug("PCAP link type detected")
+		return reader, linkType, nil
+	}
+	pcapErr := err
+
+	// Try pcapng format
+	ngReader, err := pcapgo.NewNgReader(bytes.NewReader(data), pcapgo.DefaultNgReaderOptions)
+	if err == nil {
+		linkType := ngReader.LinkType()
+		log.WithField("link_type", linkType.String()).Debug("PCAP link type detected (pcapng)")
+		return ngReader, linkType, nil
+	}
+
+	return nil, 0, fmt.Errorf("failed to open pcap file %s (pcap: %v, pcapng: %v)", filename, pcapErr, err)
 }
 
 // defragAndGetUDP extracts the UDP layer from a packet, transparently reassembling IPv4 fragments.
@@ -82,18 +216,12 @@ func (p *Parser) Parse(filename string) ([]types.RawPFCPMessage, error) {
 
 // ParseWithMappings reads a pcap file and returns request messages plus SEID mappings.
 func (p *Parser) ParseWithMappings(filename string) (*ParseResult, error) {
-	handle, err := pcap.OpenOffline(filename)
+	source, linkType, err := openPcapFile(filename)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open pcap file %s: %w", filename, err)
+		return nil, err
 	}
-	defer handle.Close()
 
-	linkType := handle.LinkType()
-	log.WithField("link_type", linkType.String()).Debug("PCAP link type detected")
-
-	packetSource := gopacket.NewPacketSource(handle, linkType)
-	packetSource.DecodeOptions.Lazy = true
-	packetSource.DecodeOptions.NoCopy = true
+	packetSource := gopacket.NewPacketSource(source, linkType)
 
 	result := &ParseResult{}
 	defragger := ip4defrag.NewIPv4Defragmenter()
@@ -193,13 +321,12 @@ func (p *Parser) ParseWithMappings(filename string) (*ParseResult, error) {
 
 // CountMessages returns a summary of message types found in a pcap file.
 func (p *Parser) CountMessages(filename string) (map[string]int, error) {
-	handle, err := pcap.OpenOffline(filename)
+	source, linkType, err := openPcapFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open pcap file %s: %w", filename, err)
 	}
-	defer handle.Close()
 
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	packetSource := gopacket.NewPacketSource(source, linkType)
 	counts := make(map[string]int)
 	defragger := ip4defrag.NewIPv4Defragmenter()
 

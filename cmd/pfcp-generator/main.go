@@ -17,6 +17,7 @@ import (
 	"pfcp-generator/internal/pcap"
 	"pfcp-generator/internal/session"
 	"pfcp-generator/internal/stats"
+	"pfcp-generator/pkg/types"
 )
 
 var (
@@ -58,6 +59,12 @@ file, modifying session-specific identifiers, and replaying them to a target UPF
 	rootCmd.Flags().Bool("strip-ipv6", true, "Strip IPv6 from UE IP Address IEs")
 	rootCmd.Flags().Int("repeat", 1, "Number of replay iterations (0 = infinite)")
 	rootCmd.Flags().Int("repeat-interval", 0, "Delay between repeat iterations in ms")
+
+	// Stress test flags
+	rootCmd.Flags().Bool("stress", false, "Enable high-performance stress test mode")
+	rootCmd.Flags().Int("tps", 0, "Target transactions per second (stress mode)")
+	rootCmd.Flags().Int("active-sessions", 0, "Max concurrent active sessions (stress mode)")
+	rootCmd.Flags().Int("duration", 0, "Test duration in seconds (stress mode, 0=unlimited)")
 
 	// Bind CLI flags to viper
 	v := viper.New()
@@ -192,8 +199,15 @@ func run(cmd *cobra.Command, args []string) error {
 
 	log.WithField("local_addr", client.LocalAddr()).Info("UDP client started")
 
-	// Create receiver
-	receiver := network.NewReceiver(client.Conn())
+	// Create receiver with dynamic buffer size for stress mode
+	recvBufSize := 1000
+	if cfg.Stress.Enabled && cfg.Stress.TPS > 0 {
+		recvBufSize = cfg.Stress.TPS * 2
+		if recvBufSize < 50000 {
+			recvBufSize = 50000
+		}
+	}
+	receiver := network.NewReceiver(client.Conn(), recvBufSize)
 	receiver.Start(ctx)
 
 	// Create transaction tracker
@@ -221,6 +235,58 @@ func run(cmd *cobra.Command, args []string) error {
 	// Start response handler once (shared across all replay iterations)
 	mgr.StartResponseHandler(ctx)
 
+	// Dispatch to stress mode or normal mode
+	if cfg.Stress.Enabled {
+		return runStressMode(ctx, mgr, cfg, messages, parseResult, statsCollector, reporter)
+	}
+
+	return runNormalMode(ctx, mgr, cfg, messages, reporter)
+}
+
+func runStressMode(ctx context.Context, mgr *session.Manager, cfg *config.Config, messages []types.RawPFCPMessage, parseResult *pcap.ParseResult, statsCollector *stats.Collector, reporter *stats.Reporter) error {
+	// Build replay plan from pcap messages
+	plan, err := session.BuildReplayPlan(messages, parseResult.SEIDMappings)
+	if err != nil {
+		return fmt.Errorf("failed to build replay plan: %w", err)
+	}
+
+	fmt.Printf("Stress test mode: %d templates, %d msgs/session\n", len(plan.Templates), plan.MessagesPerSession)
+	fmt.Printf("Target: %d TPS, %d active sessions", cfg.Stress.TPS, cfg.Stress.ActiveSessions)
+	if cfg.Stress.DurationSec > 0 {
+		fmt.Printf(", %d seconds\n", cfg.Stress.DurationSec)
+	} else {
+		fmt.Println(", unlimited duration")
+	}
+	fmt.Println()
+
+	duration := time.Duration(cfg.Stress.DurationSec) * time.Second
+
+	if err := mgr.ReplayStress(ctx, plan, float64(cfg.Stress.TPS), cfg.Stress.ActiveSessions, duration); err != nil {
+		if ctx.Err() != nil {
+			log.Info("Stress test interrupted by shutdown")
+		} else {
+			log.WithError(err).Error("Stress test failed")
+		}
+	}
+
+	// Cleanup
+	if cfg.Session.CleanupOnExit {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		mgr.CleanupSessions(cleanupCtx)
+		cleanupCancel()
+	}
+
+	if cfg.Stats.Enabled {
+		reporter.PrintFinalReport()
+		if err := reporter.ExportJSON(); err != nil {
+			log.WithError(err).Warn("Failed to export statistics")
+		}
+	}
+
+	return nil
+}
+
+func runNormalMode(ctx context.Context, mgr *session.Manager, cfg *config.Config, messages []types.RawPFCPMessage, reporter *stats.Reporter) error {
 	repeatCount := cfg.Input.RepeatCount
 	repeatInterval := time.Duration(cfg.Timing.RepeatIntervalMs) * time.Millisecond
 
@@ -388,5 +454,22 @@ func bindViperFlags(v *viper.Viper, cmd *cobra.Command) {
 	if cmd.Flags().Changed("repeat-interval") {
 		val, _ := cmd.Flags().GetInt("repeat-interval")
 		v.Set("timing.repeat_interval_ms", val)
+	}
+	// Stress test flags
+	if cmd.Flags().Changed("stress") {
+		val, _ := cmd.Flags().GetBool("stress")
+		v.Set("stress.enabled", val)
+	}
+	if cmd.Flags().Changed("tps") {
+		val, _ := cmd.Flags().GetInt("tps")
+		v.Set("stress.tps", val)
+	}
+	if cmd.Flags().Changed("active-sessions") {
+		val, _ := cmd.Flags().GetInt("active-sessions")
+		v.Set("stress.active_sessions", val)
+	}
+	if cmd.Flags().Changed("duration") {
+		val, _ := cmd.Flags().GetInt("duration")
+		v.Set("stress.duration_sec", val)
 	}
 }
