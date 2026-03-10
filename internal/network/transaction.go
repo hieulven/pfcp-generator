@@ -14,10 +14,16 @@ import (
 
 const numShards = 64
 
+// RetransmitSender can send data on a specific port index (for retransmission).
+type RetransmitSender interface {
+	SendOn(portIndex int, data []byte) error
+}
+
 // PendingTransaction represents a request awaiting a response.
 type PendingTransaction struct {
 	SeqNum      uint32
 	RequestData []byte
+	PortIndex   int
 	SentAt      time.Time
 	RetryCount  int
 	ResultCh    chan types.TransactionResult
@@ -33,11 +39,11 @@ type TransactionTracker struct {
 	shards     [numShards]txShard
 	timeout    time.Duration
 	maxRetries int
-	sender     *UDPClient
+	sender     RetransmitSender
 }
 
 // NewTransactionTracker creates a new transaction tracker.
-func NewTransactionTracker(sender *UDPClient, timeoutMs int, maxRetries int) *TransactionTracker {
+func NewTransactionTracker(sender RetransmitSender, timeoutMs int, maxRetries int) *TransactionTracker {
 	t := &TransactionTracker{
 		timeout:    time.Duration(timeoutMs) * time.Millisecond,
 		maxRetries: maxRetries,
@@ -54,7 +60,8 @@ func (t *TransactionTracker) shard(seqNum uint32) *txShard {
 }
 
 // Track registers a new pending transaction and returns a channel for the result.
-func (t *TransactionTracker) Track(seqNum uint32, requestData []byte) <-chan types.TransactionResult {
+// portIndex identifies which source port was used (for retransmission on the same port).
+func (t *TransactionTracker) Track(seqNum uint32, requestData []byte, portIndex int) <-chan types.TransactionResult {
 	s := t.shard(seqNum)
 	resultCh := make(chan types.TransactionResult, 1)
 
@@ -62,6 +69,7 @@ func (t *TransactionTracker) Track(seqNum uint32, requestData []byte) <-chan typ
 	s.pending[seqNum] = &PendingTransaction{
 		SeqNum:      seqNum,
 		RequestData: requestData,
+		PortIndex:   portIndex,
 		SentAt:      time.Now(),
 		ResultCh:    resultCh,
 	}
@@ -148,7 +156,7 @@ func (t *TransactionTracker) handleTimeout(tx *PendingTransaction) {
 			"max":     t.maxRetries,
 		}).Warn("Transaction timeout, retransmitting")
 
-		if err := t.sender.Send(tx.RequestData); err != nil {
+		if err := t.sender.SendOn(tx.PortIndex, tx.RequestData); err != nil {
 			log.WithError(err).WithField("seq_num", tx.SeqNum).Error("Retransmission failed")
 		}
 	} else {

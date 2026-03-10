@@ -69,10 +69,9 @@ The PFCP Message Generator is a Go application that emulates an SMF node by repl
 │  - Preserve F-TEID and all other IEs                         │
 ├──────────────────────────────────────────────────────────────┤
 │  Network Layer                                               │
-│  - UDP Client (send to UPF port 8805)                        │
-│  - Response Receiver (async listener)                        │
-│  - Transaction Tracker (seq# → pending request mapping)      │
-│  - Retransmission handler                                    │
+│  - UDP Client Pool (multi-source-port, round-robin)          │
+│  - Response Receiver (multi-conn async listener)             │
+│  - Transaction Tracker (seq# → pending, port-aware retx)    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -110,13 +109,13 @@ The PFCP Message Generator is a Go application that emulates an SMF node by repl
               └───────────┬──────────────┘                          │
                           │   Send (lock-free)                      │
                     ┌─────▼─────────────────────────────────────────▼──┐
-                    │                    UDPConn                        │
-                    │        WriteToUDP (goroutine-safe)                │
-                    │        ReadFromUDP (single receiver goroutine)    │
+                    │              UDPClientPool                        │
+                    │   N UDPConns (round-robin, goroutine-safe)        │
+                    │   Port range: smfPort .. smfPort+N-1              │
                     └──────────┬───────────────────────────────────────┘
                                │
                     ┌──────────▼─────────────────────┐
-                    │     Receiver Goroutine          │
+                    │   Receiver (1 goroutine/conn)   │
                     │  ReadFromUDP → parse → msgChan  │
                     │  (buffer = 2 × targetTPS)       │
                     └──────────┬─────────────────────┘
@@ -132,14 +131,15 @@ The PFCP Message Generator is a Go application that emulates an SMF node by repl
 
 | Component | Technique | Impact |
 |-----------|-----------|--------|
-| UDP Send | Removed mutex (UDPConn is goroutine-safe) | Allows parallel writes |
-| Receiver | `sync.Pool` buffers, dynamic channel size | Reduces GC, prevents overflow |
+| UDP Send | Multi-port pool, lock-free (UDPConn goroutine-safe) | Parallel writes, RSS distribution |
+| Receiver | Multi-conn fan-in, `sync.Pool` buffers, dynamic channel | Reduces GC, prevents overflow |
 | Stats | `sync/atomic` counters, fixed-bucket histogram | Lock-free, constant memory |
-| Transactions | 64-shard map | 64× less contention |
+| Transactions | 64-shard map, port-aware retransmission | 64× less contention |
 | IP Pool | `[]uint32` free-list stack | O(1) alloc/release, no strings |
 | SEID Alloc | `atomic.Uint64` counter + free-list | Lock-free fast path |
 | Rate Limiter | Batch ticker (50 tokens/ms at 50K TPS) | Reliable at high rates |
 | Sequence Counter | `atomic.Uint32` | Lock-free |
+| Modifier | Vendor IE stripping (type >= 32768) | Clean messages to UPF |
 
 **Resource budget (50K TPS, 10K sessions):**
 
@@ -170,7 +170,7 @@ pfcp-generator/
 │   ├── pfcp/
 │   │   ├── decoder.go                 # wmnsk/go-pfcp wrapper for decoding raw bytes
 │   │   ├── encoder.go                 # wmnsk/go-pfcp wrapper for encoding messages
-│   │   ├── modifier.go               # IE modification logic (F-SEID, UE IP, header)
+│   │   ├── modifier.go               # IE modification (F-SEID, UE IP, vendor IE strip)
 │   │   └── message_types.go          # Message type helpers and constants
 │   ├── session/
 │   │   ├── manager.go                 # Session lifecycle: Replay + ReplayStress
@@ -180,8 +180,9 @@ pfcp-generator/
 │   │   └── ip_pool.go                # Free-list stack UE IP allocation
 │   ├── network/
 │   │   ├── sender.go                  # Lock-free UDP client
-│   │   ├── receiver.go               # Async receiver with sync.Pool buffers
-│   │   └── transaction.go            # 64-shard transaction tracker
+│   │   ├── pool.go                    # Multi-source-port UDP client pool
+│   │   ├── receiver.go               # Multi-conn async receiver with sync.Pool
+│   │   └── transaction.go            # 64-shard tracker (port-aware retransmission)
 │   └── stats/
 │       ├── collector.go               # Atomic counters + fixed-bucket histogram
 │       └── reporter.go               # Console/JSON statistics output
@@ -309,11 +310,12 @@ type RawPFCPMessage struct {
 | Header SEID | Set to remote SEID or 0 | All session-related requests |
 | Header Sequence Number | Increment | All requests |
 | Node ID | Optionally update | Association Setup Request |
+| Vendor IEs (Type >= 32768) | Strip recursively if configured | Establishment, Modification |
 
 **Preservation rules:**
 - PDR ID, FAR ID, QER ID, URR ID, BAR ID: pass through unchanged
 - F-TEID: pass through unchanged
-- All other IEs: pass through unchanged
+- All other standard IEs: pass through unchanged
 
 **Interface:**
 ```go
@@ -365,35 +367,46 @@ type SessionInfo struct {
 
 **Responsibility:** Handle UDP communication with the UPF.
 
+**Client Pool (`pool.go`):**
+- Manages N `UDPClient` instances on sequential ports (smfPort to smfPort+N-1)
+- Round-robin dispatch via `atomic.Uint64` counter
+- `SendOn(portIndex, data)` for deterministic retransmission on the same port
+- `Conns()` returns all connections for receiver fan-in
+
 **Sender (`sender.go`):**
-- Creates UDP connection to UPF address:port
-- Sends serialized PFCP messages
+- Creates a single UDP connection to UPF address:port
+- Lock-free `WriteToUDP` (Go's `UDPConn` is goroutine-safe)
 - Binds to configured SMF address:port
 
 **Receiver (`receiver.go`):**
-- Listens for incoming UDP messages on the bound socket
-- Runs in a separate goroutine
-- Parses received PFCP messages
-- Dispatches to transaction tracker for matching
+- Listens for incoming UDP messages across N connections (one goroutine per conn)
+- Fans in to a single shared channel
+- `sync.Pool` for receive buffer reuse
+- Parses received PFCP messages and dispatches to transaction tracker
 
 **Transaction Tracker (`transaction.go`):**
-- Maps sequence number → pending transaction
-- Each transaction has: request message, send time, retry count, response channel
-- Timeout goroutine monitors pending transactions
-- Retransmits on timeout up to max retries
+- 64-shard map: sequence number → pending transaction
+- Each transaction stores: request data, send time, retry count, response channel, **port index**
+- Timeout goroutine monitors pending transactions across all shards
+- Retransmits on timeout using the **same source port** as the original request
 - Resolves transactions when matching response arrives
 
-**Interface:**
+**Key types:**
 ```go
-type NetworkClient interface {
-    Send(data []byte) error
-    Receive() (<-chan ReceivedMessage, error)
-    Close() error
+type UDPClientPool struct {
+    clients []*UDPClient
+    counter atomic.Uint64
 }
 
-type TransactionTracker interface {
-    Track(seqNum uint32, request []byte) <-chan TransactionResult
-    Resolve(seqNum uint32, response message.Message)
+type RetransmitSender interface {
+    SendOn(portIndex int, data []byte) error
+}
+
+type PendingTransaction struct {
+    SeqNum      uint32
+    RequestData []byte
+    PortIndex   int  // source port used, for retransmission
+    ...
 }
 ```
 
@@ -519,8 +532,8 @@ Main Goroutine
 │   ├── Decode → Modify → Send (sequential per message)
 │   └── Wait for response (with timeout)
 │
-├── Receiver Goroutine
-│   └── Listens on UDP socket, dispatches to Transaction Tracker
+├── Receiver Goroutines (1 per source port)
+│   └── Listen on UDP sockets, fan-in to shared msgChan
 │
 ├── Transaction Timeout Monitor Goroutine
 │   └── Periodically checks for timed-out transactions (64 shards)
@@ -549,16 +562,16 @@ Main Goroutine
 │   ├── For each template message:
 │   │   ├── rate.Wait() — blocks until rate limiter grants a token
 │   │   ├── Modify message (SEID, UE IP, seq#)
-│   │   ├── Send via lock-free UDPConn.WriteToUDP()
+│   │   ├── Send via UDPClientPool (round-robin source port)
 │   │   └── Wait for response via 64-shard transaction tracker
 │   └── Release semaphore slot on session completion
 │
 ├── Rate Limiter Goroutine
 │   └── Batch ticker: produces batchSize tokens per tick (e.g., 50 tokens/ms at 50K TPS)
 │
-├── Receiver Goroutine
+├── Receiver Goroutines (1 per source port)
 │   ├── ReadFromUDP with sync.Pool buffer reuse
-│   └── Dispatches to msgChan (buffer = 2 × targetTPS)
+│   └── Fan-in to shared msgChan (buffer = 2 × targetTPS)
 │
 ├── Response Handler Goroutine
 │   └── Drains msgChan → tracker.Resolve() (sharded by seq num)
@@ -581,7 +594,7 @@ Main Goroutine
 | Statistics Collector | `sync/atomic` counters | Same |
 | Response Times | Fixed-bucket histogram (`atomic.Uint64` per bucket) | Same |
 | Sequence Counter | `atomic.Uint32` with CAS | Same |
-| UDP Send | Lock-free (`UDPConn` is goroutine-safe) | Same |
+| UDP Send | Multi-port pool, lock-free (UDPConn goroutine-safe) | Same |
 
 All goroutines respect `context.Context` for shutdown.
 

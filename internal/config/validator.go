@@ -21,6 +21,13 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Sprintf("smf.port must be between 1 and 65535, got %d", c.SMF.Port))
 	}
 
+	// Source ports must be valid
+	if c.SMF.SourcePorts < 1 || c.SMF.SourcePorts > 256 {
+		errs = append(errs, fmt.Sprintf("smf.source_ports must be between 1 and 256, got %d", c.SMF.SourcePorts))
+	} else if c.SMF.Port+c.SMF.SourcePorts-1 > 65535 {
+		errs = append(errs, fmt.Sprintf("smf.port + smf.source_ports exceeds port range: %d + %d", c.SMF.Port, c.SMF.SourcePorts))
+	}
+
 	// UPF address must be a valid IP
 	if net.ParseIP(c.UPF.Address) == nil {
 		errs = append(errs, fmt.Sprintf("upf.address must be a valid IP address, got %q", c.UPF.Address))

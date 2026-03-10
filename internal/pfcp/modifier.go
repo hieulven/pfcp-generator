@@ -10,15 +10,17 @@ import (
 
 // Modifier applies session-specific modifications to PFCP messages.
 type Modifier struct {
-	smfIP     net.IP
-	stripIPv6 bool
+	smfIP          net.IP
+	stripIPv6      bool
+	stripVendorIEs bool
 }
 
 // NewModifier creates a new PFCP message modifier.
-func NewModifier(smfIP net.IP, stripIPv6 bool) *Modifier {
+func NewModifier(smfIP net.IP, stripIPv6 bool, stripVendorIEs bool) *Modifier {
 	return &Modifier{
-		smfIP:     smfIP,
-		stripIPv6: stripIPv6,
+		smfIP:          smfIP,
+		stripIPv6:      stripIPv6,
+		stripVendorIEs: stripVendorIEs,
 	}
 }
 
@@ -83,6 +85,16 @@ func (m *Modifier) ModifySessionEstablishment(
 		}
 	}
 
+	// Strip vendor-specific IEs (type >= 32768)
+	if m.stripVendorIEs {
+		msg.CreatePDR = filterVendorIEs(msg.CreatePDR)
+		msg.CreateFAR = filterVendorIEs(msg.CreateFAR)
+		msg.CreateURR = filterVendorIEs(msg.CreateURR)
+		msg.CreateQER = filterVendorIEs(msg.CreateQER)
+		msg.CreateBAR = stripVendorChildren(msg.CreateBAR)
+		msg.IEs = filterVendorIEs(msg.IEs)
+	}
+
 	return nil
 }
 
@@ -108,6 +120,20 @@ func (m *Modifier) ModifySessionModification(
 		if err := m.modifyUEIPInCreatePDRs(msg.UpdatePDR, ueIP); err != nil {
 			return fmt.Errorf("failed to modify UE IP in Update PDRs: %w", err)
 		}
+	}
+
+	// Strip vendor-specific IEs from modification messages
+	if m.stripVendorIEs {
+		msg.CreatePDR = filterVendorIEs(msg.CreatePDR)
+		msg.CreateFAR = filterVendorIEs(msg.CreateFAR)
+		msg.UpdatePDR = filterVendorIEs(msg.UpdatePDR)
+		msg.UpdateFAR = filterVendorIEs(msg.UpdateFAR)
+		msg.CreateURR = filterVendorIEs(msg.CreateURR)
+		msg.UpdateURR = filterVendorIEs(msg.UpdateURR)
+		msg.CreateQER = filterVendorIEs(msg.CreateQER)
+		msg.UpdateQER = filterVendorIEs(msg.UpdateQER)
+		msg.UpdateBAR = stripVendorChildren(msg.UpdateBAR)
+		msg.IEs = filterVendorIEs(msg.IEs)
 	}
 
 	return nil
@@ -246,6 +272,34 @@ func (m *Modifier) createModifiedUEIPIE(original *ie.IE, newUEIP net.IP) *ie.IE 
 	}
 
 	return nil
+}
+
+// filterVendorIEs removes vendor-specific IEs (type >= 32768) from a slice,
+// recursively filtering children of grouped IEs.
+func filterVendorIEs(ies []*ie.IE) []*ie.IE {
+	if len(ies) == 0 {
+		return ies
+	}
+	result := make([]*ie.IE, 0, len(ies))
+	for _, i := range ies {
+		if i.Type >= 32768 {
+			continue
+		}
+		if len(i.ChildIEs) > 0 {
+			i.ChildIEs = filterVendorIEs(i.ChildIEs)
+		}
+		result = append(result, i)
+	}
+	return result
+}
+
+// stripVendorChildren strips vendor IEs from a single grouped IE's children.
+func stripVendorChildren(grouped *ie.IE) *ie.IE {
+	if grouped == nil || len(grouped.ChildIEs) == 0 {
+		return grouped
+	}
+	grouped.ChildIEs = filterVendorIEs(grouped.ChildIEs)
+	return grouped
 }
 
 // ExtractCPSEID extracts the CP SEID from a Session Establishment Request's F-SEID IE.

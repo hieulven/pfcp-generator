@@ -4,6 +4,7 @@
 smf:
   address: "192.168.1.10"       # Local IP to bind for PFCP
   port: 8805                     # Local PFCP port
+  source_ports: 1                # Number of source UDP ports (1-256, ports are sequential from 'port')
 
 # Target UPF configuration
 upf:
@@ -20,6 +21,7 @@ session:
   seid_strategy: "sequential"    # "sequential" or "random"
   ue_ip_pool: "10.60.0.0/16"    # UE IPv4 address pool (CIDR notation)
   strip_ipv6: true               # Strip IPv6 from UE IP Address IEs, force IPv4-only
+  strip_vendor_ies: true         # Strip vendor-specific IEs (type >= 32768) from messages
   cleanup_on_exit: false         # Delete all sessions on shutdown
 
 # Timing configuration
@@ -37,7 +39,7 @@ input:
 # Logging configuration
 logging:
   level: "info"                  # "debug", "info", "warn", "error"
-  file: ""                       # Log file path (empty = console only)
+  file: ""                       # Log file path (empty = console only, auto-set in stress mode)
   console: true                  # Log to stdout
 
 # Statistics configuration
@@ -45,3 +47,10 @@ stats:
   enabled: true                  # Enable statistics collection
   report_interval_sec: 10        # Periodic report interval (0 = final report only)
   export_file: ""                # Export stats to JSON file (empty = no export)
+
+# Stress test mode (overrides timing/repeat settings)
+stress:
+  enabled: false                 # Enable high-performance stress test mode
+  tps: 50000                     # Target transactions per second
+  active_sessions: 10000         # Max concurrent active sessions
+  duration_sec: 0                # Test duration in seconds (0 = unlimited)

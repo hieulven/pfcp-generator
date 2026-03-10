@@ -22,7 +22,7 @@ import (
 // Manager orchestrates the PFCP session replay workflow.
 type Manager struct {
 	cfg        *config.Config
-	client     *network.UDPClient
+	pool       *network.UDPClientPool
 	receiver   *network.Receiver
 	tracker    *network.TransactionTracker
 	modifier   *pfcp.Modifier
@@ -62,7 +62,7 @@ func (s *SequenceCounter) Next() uint32 {
 // NewManager creates a new session manager.
 func NewManager(
 	cfg *config.Config,
-	client *network.UDPClient,
+	pool *network.UDPClientPool,
 	receiver *network.Receiver,
 	tracker *network.TransactionTracker,
 	statsCollector *stats.Collector,
@@ -75,11 +75,11 @@ func NewManager(
 		return nil, fmt.Errorf("failed to create UE IP pool: %w", err)
 	}
 
-	modifier := pfcp.NewModifier(smfIP, cfg.Session.StripIPv6)
+	modifier := pfcp.NewModifier(smfIP, cfg.Session.StripIPv6, cfg.Session.StripVendorIEs)
 
 	return &Manager{
 		cfg:                   cfg,
-		client:                client,
+		pool:                  pool,
 		receiver:              receiver,
 		tracker:               tracker,
 		modifier:              modifier,
@@ -355,9 +355,10 @@ func (m *Manager) handleAssociationSetup(ctx context.Context, msg message.Messag
 
 	msgTypeName := "AssociationSetupRequest"
 	m.stats.RecordSent(msgTypeName)
-	resultCh := m.tracker.Track(seqNum, data)
+	portIdx := m.pool.NextPortIndex()
+	resultCh := m.tracker.Track(seqNum, data, portIdx)
 
-	if err := m.client.Send(data); err != nil {
+	if err := m.pool.SendOn(portIdx, data); err != nil {
 		return fmt.Errorf("failed to send Association Setup: %w", err)
 	}
 
@@ -440,9 +441,10 @@ func (m *Manager) handleSessionEstablishment(ctx context.Context, msg message.Me
 
 	msgTypeName := "SessionEstablishmentRequest"
 	m.stats.RecordSent(msgTypeName)
-	resultCh := m.tracker.Track(seqNum, data)
+	portIdx := m.pool.NextPortIndex()
+	resultCh := m.tracker.Track(seqNum, data, portIdx)
 
-	if err := m.client.Send(data); err != nil {
+	if err := m.pool.SendOn(portIdx, data); err != nil {
 		return fmt.Errorf("failed to send Session Establishment: %w", err)
 	}
 
@@ -545,9 +547,10 @@ func (m *Manager) handleSessionModification(ctx context.Context, msg message.Mes
 
 	msgTypeName := "SessionModificationRequest"
 	m.stats.RecordSent(msgTypeName)
-	resultCh := m.tracker.Track(seqNum, data)
+	portIdx := m.pool.NextPortIndex()
+	resultCh := m.tracker.Track(seqNum, data, portIdx)
 
-	if err := m.client.Send(data); err != nil {
+	if err := m.pool.SendOn(portIdx, data); err != nil {
 		return fmt.Errorf("failed to send Session Modification: %w", err)
 	}
 
@@ -601,9 +604,10 @@ func (m *Manager) handleSessionDeletion(ctx context.Context, msg message.Message
 
 	msgTypeName := "SessionDeletionRequest"
 	m.stats.RecordSent(msgTypeName)
-	resultCh := m.tracker.Track(seqNum, data)
+	portIdx := m.pool.NextPortIndex()
+	resultCh := m.tracker.Track(seqNum, data, portIdx)
 
-	if err := m.client.Send(data); err != nil {
+	if err := m.pool.SendOn(portIdx, data); err != nil {
 		return fmt.Errorf("failed to send Session Deletion: %w", err)
 	}
 
@@ -665,9 +669,10 @@ func (m *Manager) handleHeartbeat(ctx context.Context, msg message.Message) erro
 
 	msgTypeName := "HeartbeatRequest"
 	m.stats.RecordSent(msgTypeName)
-	resultCh := m.tracker.Track(seqNum, data)
+	portIdx := m.pool.NextPortIndex()
+	resultCh := m.tracker.Track(seqNum, data, portIdx)
 
-	if err := m.client.Send(data); err != nil {
+	if err := m.pool.SendOn(portIdx, data); err != nil {
 		return fmt.Errorf("failed to send Heartbeat: %w", err)
 	}
 
@@ -716,8 +721,9 @@ func (m *Manager) CleanupSessions(ctx context.Context) {
 			continue
 		}
 
-		resultCh := m.tracker.Track(seqNum, data)
-		if err := m.client.Send(data); err != nil {
+		portIdx := m.pool.NextPortIndex()
+		resultCh := m.tracker.Track(seqNum, data, portIdx)
+		if err := m.pool.SendOn(portIdx, data); err != nil {
 			log.WithError(err).WithField("local_seid", session.LocalSEID).Error("Failed to send cleanup deletion")
 			continue
 		}

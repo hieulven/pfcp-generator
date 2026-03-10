@@ -60,6 +60,9 @@ file, modifying session-specific identifiers, and replaying them to a target UPF
 	rootCmd.Flags().Int("repeat", 1, "Number of replay iterations (0 = infinite)")
 	rootCmd.Flags().Int("repeat-interval", 0, "Delay between repeat iterations in ms")
 
+	rootCmd.Flags().Int("source-ports", 0, "Number of source UDP ports (default 1)")
+	rootCmd.Flags().Bool("strip-vendor-ies", true, "Strip vendor-specific IEs (type >= 32768)")
+
 	// Stress test flags
 	rootCmd.Flags().Bool("stress", false, "Enable high-performance stress test mode")
 	rootCmd.Flags().Int("tps", 0, "Target transactions per second (stress mode)")
@@ -196,14 +199,18 @@ func run(cmd *cobra.Command, args []string) error {
 		cancel()
 	}()
 
-	// Create network client
-	client, err := network.NewUDPClient(cfg.SMF.Address, cfg.SMF.Port, cfg.UPF.Address, cfg.UPF.Port)
+	// Create network client pool
+	pool, err := network.NewUDPClientPool(cfg.SMF.Address, cfg.SMF.Port, cfg.UPF.Address, cfg.UPF.Port, cfg.SMF.SourcePorts)
 	if err != nil {
-		return fmt.Errorf("failed to create UDP client: %w", err)
+		return fmt.Errorf("failed to create UDP client pool: %w", err)
 	}
-	defer client.Close()
+	defer pool.Close()
 
-	log.WithField("local_addr", client.LocalAddr()).Info("UDP client started")
+	if pool.Size() > 1 {
+		log.WithField("ports", pool.LocalAddrs()).Infof("UDP client pool started (%d ports)", pool.Size())
+	} else {
+		log.WithField("local_addr", pool.LocalAddrs()[0]).Info("UDP client started")
+	}
 
 	// Create receiver with dynamic buffer size for stress mode
 	recvBufSize := 1000
@@ -213,11 +220,11 @@ func run(cmd *cobra.Command, args []string) error {
 			recvBufSize = 50000
 		}
 	}
-	receiver := network.NewReceiver(client.Conn(), recvBufSize)
+	receiver := network.NewMultiReceiver(pool.Conns(), recvBufSize)
 	receiver.Start(ctx)
 
 	// Create transaction tracker
-	tracker := network.NewTransactionTracker(client, cfg.Timing.ResponseTimeoutMs, cfg.Timing.MaxRetries)
+	tracker := network.NewTransactionTracker(pool, cfg.Timing.ResponseTimeoutMs, cfg.Timing.MaxRetries)
 	tracker.StartTimeoutMonitor(ctx)
 
 	// Create stats collector and reporter
@@ -230,7 +237,7 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create session manager
-	mgr, err := session.NewManager(cfg, client, receiver, tracker, statsCollector)
+	mgr, err := session.NewManager(cfg, pool, receiver, tracker, statsCollector)
 	if err != nil {
 		return fmt.Errorf("failed to create session manager: %w", err)
 	}
@@ -472,6 +479,14 @@ func bindViperFlags(v *viper.Viper, cmd *cobra.Command) {
 	if cmd.Flags().Changed("repeat-interval") {
 		val, _ := cmd.Flags().GetInt("repeat-interval")
 		v.Set("timing.repeat_interval_ms", val)
+	}
+	if cmd.Flags().Changed("source-ports") {
+		val, _ := cmd.Flags().GetInt("source-ports")
+		v.Set("smf.source_ports", val)
+	}
+	if cmd.Flags().Changed("strip-vendor-ies") {
+		val, _ := cmd.Flags().GetBool("strip-vendor-ies")
+		v.Set("session.strip_vendor_ies", val)
 	}
 	if cmd.Flags().Changed("log-file") {
 		val, _ := cmd.Flags().GetString("log-file")

@@ -21,9 +21,10 @@ type Config struct {
 }
 
 type SMFConfig struct {
-	Address string `yaml:"address" mapstructure:"address"`
-	Port    int    `yaml:"port"    mapstructure:"port"`
-	NodeID  string `yaml:"node_id" mapstructure:"node_id"`
+	Address     string `yaml:"address"      mapstructure:"address"`
+	Port        int    `yaml:"port"         mapstructure:"port"`
+	NodeID      string `yaml:"node_id"      mapstructure:"node_id"`
+	SourcePorts int    `yaml:"source_ports" mapstructure:"source_ports"`
 }
 
 type UPFConfig struct {
@@ -36,11 +37,12 @@ type AssociationConfig struct {
 }
 
 type SessionConfig struct {
-	SEIDStart     uint64 `yaml:"seid_start"      mapstructure:"seid_start"`
-	SEIDStrategy  string `yaml:"seid_strategy"   mapstructure:"seid_strategy"`
-	UEIPPool      string `yaml:"ue_ip_pool"      mapstructure:"ue_ip_pool"`
-	StripIPv6     bool   `yaml:"strip_ipv6"      mapstructure:"strip_ipv6"`
-	CleanupOnExit bool   `yaml:"cleanup_on_exit" mapstructure:"cleanup_on_exit"`
+	SEIDStart      uint64 `yaml:"seid_start"       mapstructure:"seid_start"`
+	SEIDStrategy   string `yaml:"seid_strategy"    mapstructure:"seid_strategy"`
+	UEIPPool       string `yaml:"ue_ip_pool"       mapstructure:"ue_ip_pool"`
+	StripIPv6      bool   `yaml:"strip_ipv6"       mapstructure:"strip_ipv6"`
+	StripVendorIEs bool   `yaml:"strip_vendor_ies" mapstructure:"strip_vendor_ies"`
+	CleanupOnExit  bool   `yaml:"cleanup_on_exit"  mapstructure:"cleanup_on_exit"`
 }
 
 type TimingConfig struct {
@@ -78,11 +80,13 @@ type StressConfig struct {
 // SetDefaults configures default values for the configuration.
 func SetDefaults(v *viper.Viper) {
 	v.SetDefault("smf.port", 8805)
+	v.SetDefault("smf.source_ports", 1)
 	v.SetDefault("upf.port", 8805)
 	v.SetDefault("association.enabled", true)
 	v.SetDefault("session.seid_start", 1)
 	v.SetDefault("session.seid_strategy", "sequential")
 	v.SetDefault("session.strip_ipv6", true)
+	v.SetDefault("session.strip_vendor_ies", true)
 	v.SetDefault("session.cleanup_on_exit", false)
 	v.SetDefault("input.repeat_count", 1)
 	v.SetDefault("timing.message_interval_ms", 100)
@@ -132,7 +136,11 @@ func LoadWithViper(v *viper.Viper) (*Config, error) {
 func (c *Config) Summary() string {
 	var sb strings.Builder
 	sb.WriteString("Configuration:\n")
-	sb.WriteString(fmt.Sprintf("  SMF:           %s:%d\n", c.SMF.Address, c.SMF.Port))
+	if c.SMF.SourcePorts > 1 {
+		sb.WriteString(fmt.Sprintf("  SMF:           %s:%d-%d (%d ports)\n", c.SMF.Address, c.SMF.Port, c.SMF.Port+c.SMF.SourcePorts-1, c.SMF.SourcePorts))
+	} else {
+		sb.WriteString(fmt.Sprintf("  SMF:           %s:%d\n", c.SMF.Address, c.SMF.Port))
+	}
 	sb.WriteString(fmt.Sprintf("  UPF:           %s:%d\n", c.UPF.Address, c.UPF.Port))
 	sb.WriteString(fmt.Sprintf("  Association:   enabled=%v\n", c.Association.Enabled))
 	sb.WriteString(fmt.Sprintf("  PCAP:          %s\n", c.Input.PcapFile))

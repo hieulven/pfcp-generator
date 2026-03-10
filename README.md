@@ -112,6 +112,7 @@ pfcp-generator \
 The tool groups pcap messages into session templates (Establishment + Modifications + Deletion), then dispatches them across a worker pool. A rate limiter controls TPS, and a semaphore caps concurrent active sessions.
 
 **Architecture highlights:**
+- Multi-source-port UDP pool with round-robin dispatch (`--source-ports 16`)
 - Lock-free UDP writes (Go's `UDPConn` is goroutine-safe)
 - 64-shard transaction tracker to reduce lock contention
 - Atomic counters + fixed-bucket histogram for stats (constant memory)
@@ -220,8 +221,10 @@ The tool reads from a YAML config file (default `config.yaml`) and/or CLI flags.
 | `--timeout` | `5000` | Response timeout (ms) |
 | `--max-retries` | `3` | Max retransmission attempts per message |
 | `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
+| `--source-ports` | `1` | Number of source UDP ports (1-256) |
 | `--no-association` | `false` | Skip PFCP Association Setup |
 | `--strip-ipv6` | `true` | Strip IPv6 from UE IP Address IEs |
+| `--strip-vendor-ies` | `true` | Strip vendor-specific IEs (type >= 32768) |
 | `--repeat` | `1` | Number of replay iterations (0 = infinite) |
 | `--repeat-interval` | `0` | Delay between repeat iterations (ms) |
 | `--cleanup` | `false` | Delete all active sessions on exit |
@@ -241,6 +244,7 @@ See `config.yaml` for a fully commented example. Key sections:
 smf:
   address: "192.168.1.10"
   port: 8805
+  source_ports: 1          # Number of source UDP ports (1-256)
 
 upf:
   address: "192.168.1.20"
@@ -254,6 +258,7 @@ session:
   seid_strategy: "sequential"
   ue_ip_pool: "10.60.0.0/16"
   strip_ipv6: true
+  strip_vendor_ies: true   # Strip vendor-specific IEs (type >= 32768)
   cleanup_on_exit: false
 
 timing:
@@ -268,7 +273,7 @@ input:
 
 logging:
   level: "info"
-  file: ""
+  file: ""                 # Log file path (auto-set in stress mode)
 
 stats:
   enabled: true
@@ -296,9 +301,19 @@ Two strategies are available:
 
 A CIDR block (e.g. `10.60.0.0/16`) from which UE IPv4 addresses are allocated sequentially. Addresses wrap around and are reused when sessions are deleted. The pool size limits the maximum number of concurrent sessions.
 
+### Multi-Source-Port
+
+The `--source-ports` flag (default 1) controls how many source UDP ports are used for sending. Ports are allocated sequentially starting from the SMF port (e.g. `--source-ports 16` uses ports 8805-8820). Messages are distributed across ports using round-robin. Retransmissions always use the same port as the original request.
+
+Multiple source ports help distribute load across CPU cores via RSS hashing and are more realistic for high-throughput testing.
+
 ### IPv6 Stripping
 
 Enabled by default. When a pcap contains UE IP Address IEs with both IPv4 and IPv6, the IPv6 component is removed and only IPv4 is sent to the UPF.
+
+### Vendor IE Stripping
+
+Enabled by default (`--strip-vendor-ies`). Removes vendor-specific IEs (PFCP IE type >= 32768) from all outgoing messages. These are enterprise-specific extensions that may not be understood by the target UPF. The stripping is applied recursively to all grouped IEs (CreatePDR, CreateFAR, PDI, etc.).
 
 ### Association Setup
 
@@ -326,7 +341,7 @@ PFCP messages that span multiple IP fragments (e.g. large Session Establishment 
 
 ### Retransmission
 
-If a response is not received within the timeout period, the request is retransmitted up to `max_retries` times using the same sequence number.
+If a response is not received within the timeout period, the request is retransmitted up to `max_retries` times using the same sequence number and the same source port.
 
 ### Statistics
 
@@ -389,10 +404,11 @@ internal/
   config/              Configuration loading and validation
   network/
     sender.go          Lock-free UDP client
-    receiver.go        Async receiver with sync.Pool buffers
-    transaction.go     64-shard transaction tracker
+    pool.go            Multi-source-port UDP client pool (round-robin)
+    receiver.go        Multi-conn async receiver with sync.Pool buffers
+    transaction.go     64-shard transaction tracker (port-aware retransmission)
   pcap/                Pcap parsing with SEID mapping extraction
-  pfcp/                PFCP encode/decode/modify
+  pfcp/                PFCP encode/decode/modify (vendor IE stripping)
   session/
     manager.go         Session orchestration (Replay + ReplayStress)
     grouper.go         Groups pcap messages into session templates
