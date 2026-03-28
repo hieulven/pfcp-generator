@@ -1,0 +1,202 @@
+time="2026-03-28 11:49:25.071" level=info msg="PCAP parsing complete" pfcp_packets=10 request_packets=5 total_packets=10
+time="2026-03-28 11:49:25.072" level=info msg="UDP client pool started (8 ports)" ports="[127.0.0.1:8805 127.0.0.1:8806 127.0.0.1:8807 127.0.0.1:8808 127.0.0.1:8809 127.0.0.1:8810 127.0.0.1:8811 127.0.0.1:8812]"
+time="2026-03-28 11:49:25.073" level=info msg="Built replay plan" has_association=false heartbeats=0 messages_per_session=5 templates=1
+time="2026-03-28 11:49:25.073" level=info msg="Stress test starting with adaptive delay" initial_delay_ms=666 msgs_per_session=5
+time="2026-03-28 11:51:24.897" level=info msg="PCAP parsing complete" pfcp_packets=10 request_packets=5 total_packets=10
+time="2026-03-28 11:51:24.898" level=info msg="UDP client pool started (8 ports)" ports="[127.0.0.1:8805 127.0.0.1:8806 127.0.0.1:8807 127.0.0.1:8808 127.0.0.1:8809 127.0.0.1:8810 127.0.0.1:8811 127.0.0.1:8812]"
+time="2026-03-28 11:51:24.899" level=info msg="Built replay plan" has_association=false heartbeats=0 messages_per_session=5 templates=1
+time="2026-03-28 11:51:24.899" level=info msg="Stress test starting with adaptive delay" initial_delay_ms=666 msgs_per_session=5
+time="2026-03-28 11:51:34.899" level=info msg="Stress test progress" active=2000 completed=10663 current_tps=6131 delay_ms=1579 elapsed=10s failed=0 target_tps=15000 total_sent=61315
+time="2026-03-28 11:51:44.899" level=info msg="Stress test progress" active=2000 completed=23288 current_tps=6222 delay_ms=1596 elapsed=20s failed=0 target_tps=15000 total_sent=124440
+time="2026-03-28 11:51:54.901" level=info msg="Stress test completed" completed=35772 failed=0 final_delay_ms=1610
+time="2026-03-28 11:53:33.581" level=info msg="PCAP parsing complete" pfcp_packets=10 request_packets=5 total_packets=10
+time="2026-03-28 11:53:33.582" level=info msg="UDP client pool started (8 ports)" ports="[127.0.0.1:8805 127.0.0.1:8806 127.0.0.1:8807 127.0.0.1:8808 127.0.0.1:8809 127.0.0.1:8810 127.0.0.1:8811 127.0.0.1:8812]"
+time="2026-03-28 11:53:33.584" level=info msg="Built replay plan" has_association=false heartbeats=0 messages_per_session=5 templates=1
+time="2026-03-28 11:53:33.584" level=info msg="Stress test starting with adaptive delay" msgs_per_session=5
+time="2026-03-28 11:53:43.584" level=info msg="Stress test progress" active=1989 completed=18635 current_tps=10109 delay_ms=618 elapsed=10s failed=0 target_tps=15000 total_sent=101113
+time="2026-03-28 11:53:53.584" level=info msg="Stress test progress" active=1997 completed=40958 current_tps=10638 delay_ms=886 elapsed=20s failed=0 target_tps=15000 total_sent=212778
+time="2026-03-28 11:54:03.585" level=info msg="Stress test completed" completed=62564 failed=0 final_delay_ms=944
+time="2026-03-28 11:55:06.781" level=info msg="PCAP parsing complete" pfcp_packets=10 request_packets=5 total_packets=10
+time="2026-03-28 11:55:06.782" level=info msg="UDP client pool started (8 ports)" ports="[127.0.0.1:8805 127.0.0.1:8806 127.0.0.1:8807 127.0.0.1:8808 127.0.0.1:8809 127.0.0.1:8810 127.0.0.1:8811 127.0.0.1:8812]"
+time="2026-03-28 11:55:06.784" level=info msg="Built replay plan" has_association=false heartbeats=0 messages_per_session=5 templates=1
+time="2026-03-28 11:55:06.784" level=info msg="Stress test starting with adaptive delay" msgs_per_session=5
+time="2026-03-28 11:55:16.785" level=info msg="Stress test progress" active=1945 completed=17006 current_tps=9250 delay_ms=624 elapsed=10s failed=0 target_tps=15000 total_sent=92527
+time="2026-03-28 11:55:26.784" level=info msg="Stress test progress" active=1951 completed=39600 current_tps=10284 delay_ms=794 elapsed=20s failed=0 target_tps=15000 total_sent=205692
+time="2026-03-28 11:55:36.787" level=info msg="Stress test completed" completed=62579 failed=0 final_delay_ms=794
+time="2026-03-28 11:57:00.377" level=info msg="PCAP parsing complete" pfcp_packets=10 request_packets=5 total_packets=10
+time="2026-03-28 11:57:00.378" level=info msg="UDP client pool started (8 ports)" ports="[127.0.0.1:8805 127.0.0.1:8806 127.0.0.1:8807 127.0.0.1:8808 127.0.0.1:8809 127.0.0.1:8810 127.0.0.1:8811 127.0.0.1:8812]"
+time="2026-03-28 11:57:00.380" level=info msg="Built replay plan" has_association=false heartbeats=0 messages_per_session=5 templates=1
+time="2026-03-28 11:57:00.380" level=info msg="Stress test starting with adaptive delay" msgs_per_session=5
+time="2026-03-28 11:57:10.380" level=info msg="Stress test progress" active=2000 completed=16810 current_tps=9203 delay_ms=705 elapsed=10s failed=0 target_tps=15000 total_sent=92050
+time="2026-03-28 11:57:20.380" level=info msg="Stress test progress" active=1994 completed=39113 current_tps=10176 delay_ms=814 elapsed=20s failed=0 target_tps=15000 total_sent=203542
+time="2026-03-28 11:57:30.380" level=info msg="Stress test progress" active=1984 completed=61527 current_tps=10518 delay_ms=844 elapsed=30s failed=0 target_tps=15000 total_sent=315561
+time="2026-03-28 11:57:30.385" level=info msg="Stress test completed" completed=61528 failed=0 final_delay_ms=844
+time="2026-03-28 11:57:56.512" level=info msg="PCAP parsing complete" pfcp_packets=10 request_packets=5 total_packets=10
+time="2026-03-28 11:57:56.513" level=info msg="UDP client pool started (8 ports)" ports="[127.0.0.1:8805 127.0.0.1:8806 127.0.0.1:8807 127.0.0.1:8808 127.0.0.1:8809 127.0.0.1:8810 127.0.0.1:8811 127.0.0.1:8812]"
+time="2026-03-28 11:57:56.515" level=info msg="Built replay plan" has_association=false heartbeats=0 messages_per_session=5 templates=1
+time="2026-03-28 11:57:56.515" level=info msg="Stress test starting with adaptive delay" msgs_per_session=5
+time="2026-03-28 11:58:06.515" level=info msg="Stress test progress" active=2000 completed=16869 current_tps=9233 delay_ms=680 elapsed=10s failed=0 target_tps=15000 total_sent=92345
+time="2026-03-28 11:58:16.515" level=info msg="Stress test progress" active=1995 completed=39190 current_tps=10195 delay_ms=796 elapsed=20s failed=0 target_tps=15000 total_sent=203923
+time="2026-03-28 11:58:26.517" level=info msg="Stress test progress" active=1935 completed=61864 current_tps=10553 delay_ms=818 elapsed=30s failed=0 target_tps=15000 total_sent=316625
+time="2026-03-28 11:58:36.517" level=info msg="Stress test progress" active=1972 completed=84718 current_tps=10782 delay_ms=818 elapsed=40s failed=0 target_tps=15000 total_sent=431324
+time="2026-03-28 11:58:46.514" level=info msg="Stress test progress" active=1987 completed=107673 current_tps=10925 delay_ms=818 elapsed=50s failed=0 target_tps=15000 total_sent=546264
+time="2026-03-28 11:58:56.515" level=info msg="Stress test progress" active=1965 completed=130663 current_tps=11013 delay_ms=818 elapsed=1m0s failed=0 target_tps=15000 total_sent=660786
+time="2026-03-28 11:59:06.518" level=info msg="Stress test progress" active=1947 completed=153431 current_tps=11065 delay_ms=818 elapsed=1m10s failed=0 target_tps=15000 total_sent=774632
+time="2026-03-28 11:59:16.515" level=info msg="Stress test progress" active=1950 completed=175884 current_tps=11087 delay_ms=841 elapsed=1m20s failed=0 target_tps=15000 total_sent=886992
+time="2026-03-28 11:59:26.514" level=info msg="Stress test progress" active=2000 completed=198419 current_tps=11112 delay_ms=841 elapsed=1m30s failed=0 target_tps=15000 total_sent=1000095
+time="2026-03-28 11:59:36.514" level=info msg="Stress test progress" active=2000 completed=221328 current_tps=11146 delay_ms=841 elapsed=1m40s failed=0 target_tps=15000 total_sent=1114641
+time="2026-03-28 11:59:46.515" level=info msg="Stress test progress" active=1968 completed=244102 current_tps=11166 delay_ms=841 elapsed=1m50s failed=0 target_tps=15000 total_sent=1228266
+time="2026-03-28 11:59:56.514" level=info msg="Stress test progress" active=1994 completed=266914 current_tps=11188 delay_ms=841 elapsed=2m0s failed=0 target_tps=15000 total_sent=1342543
+time="2026-03-28 12:00:06.515" level=info msg="Stress test progress" active=1978 completed=289886 current_tps=11210 delay_ms=841 elapsed=2m10s failed=0 target_tps=15000 total_sent=1457267
+time="2026-03-28 12:00:16.516" level=info msg="Stress test progress" active=1983 completed=312698 current_tps=11224 delay_ms=841 elapsed=2m20s failed=0 target_tps=15000 total_sent=1571341
+time="2026-03-28 12:00:26.514" level=info msg="Stress test progress" active=2000 completed=335772 current_tps=11246 delay_ms=841 elapsed=2m30s failed=0 target_tps=15000 total_sent=1686859
+time="2026-03-28 12:00:36.516" level=info msg="Stress test progress" active=1943 completed=358744 current_tps=11258 delay_ms=841 elapsed=2m40s failed=0 target_tps=15000 total_sent=1801248
+time="2026-03-28 12:00:46.515" level=info msg="Stress test progress" active=1984 completed=381262 current_tps=11260 delay_ms=841 elapsed=2m50s failed=0 target_tps=15000 total_sent=1914183
+time="2026-03-28 12:00:56.515" level=info msg="Stress test progress" active=1979 completed=404095 current_tps=11268 delay_ms=841 elapsed=3m0s failed=0 target_tps=15000 total_sent=2028324
+time="2026-03-28 12:01:06.514" level=info msg="Stress test progress" active=1992 completed=426672 current_tps=11270 delay_ms=841 elapsed=3m10s failed=0 target_tps=15000 total_sent=2141326
+time="2026-03-28 12:01:16.514" level=info msg="Stress test progress" active=2000 completed=449442 current_tps=11276 delay_ms=841 elapsed=3m20s failed=0 target_tps=15000 total_sent=2255210
+time="2026-03-28 12:01:26.514" level=info msg="Stress test progress" active=1979 completed=472302 current_tps=11283 delay_ms=841 elapsed=3m30s failed=0 target_tps=15000 total_sent=2369349
+time="2026-03-28 12:01:36.516" level=info msg="Stress test progress" active=1975 completed=494967 current_tps=11284 delay_ms=841 elapsed=3m40s failed=0 target_tps=15000 total_sent=2482571
+time="2026-03-28 12:01:46.514" level=info msg="Stress test progress" active=1998 completed=517813 current_tps=11291 delay_ms=841 elapsed=3m50s failed=0 target_tps=15000 total_sent=2597059
+time="2026-03-28 12:01:56.514" level=info msg="Stress test progress" active=2000 completed=540764 current_tps=11299 delay_ms=841 elapsed=4m0s failed=0 target_tps=15000 total_sent=2711818
+time="2026-03-28 12:02:06.514" level=info msg="Stress test progress" active=2000 completed=563371 current_tps=11299 delay_ms=841 elapsed=4m10s failed=0 target_tps=15000 total_sent=2824854
+time="2026-03-28 12:02:16.514" level=info msg="Stress test progress" active=1981 completed=586110 current_tps=11302 delay_ms=841 elapsed=4m20s failed=0 target_tps=15000 total_sent=2938485
+time="2026-03-28 12:02:26.514" level=info msg="Stress test progress" active=2000 completed=608968 current_tps=11307 delay_ms=841 elapsed=4m30s failed=0 target_tps=15000 total_sent=3052838
+time="2026-03-28 12:02:36.514" level=info msg="Stress test progress" active=2000 completed=631611 current_tps=11307 delay_ms=841 elapsed=4m40s failed=0 target_tps=15000 total_sent=3166056
+time="2026-03-28 12:02:46.514" level=info msg="Stress test progress" active=1990 completed=654432 current_tps=11311 delay_ms=841 elapsed=4m50s failed=0 target_tps=15000 total_sent=3280118
+time="2026-03-28 12:02:56.514" level=info msg="Stress test progress" active=1965 completed=677033 current_tps=11309 delay_ms=841 elapsed=5m0s failed=0 target_tps=15000 total_sent=3392804
+time="2026-03-28 12:02:56.518" level=info msg="Stress test completed" completed=677034 failed=0 final_delay_ms=841
+time="2026-03-28 12:03:56.292" level=info msg="PCAP parsing complete" pfcp_packets=10 request_packets=5 total_packets=10
+time="2026-03-28 12:03:56.292" level=info msg="UDP client pool started (8 ports)" ports="[127.0.0.1:8805 127.0.0.1:8806 127.0.0.1:8807 127.0.0.1:8808 127.0.0.1:8809 127.0.0.1:8810 127.0.0.1:8811 127.0.0.1:8812]"
+time="2026-03-28 12:03:56.294" level=info msg="Built replay plan" has_association=false heartbeats=0 messages_per_session=5 templates=1
+time="2026-03-28 12:03:56.294" level=info msg="Stress test starting with adaptive delay" msgs_per_session=5
+time="2026-03-28 12:04:06.294" level=info msg="Stress test progress" active=1713 completed=18671 current_tps=9894 delay_ms=95 elapsed=10s failed=0 target_tps=15000 total_sent=98952
+time="2026-03-28 12:04:16.295" level=info msg="Stress test progress" active=1900 completed=39185 current_tps=10153 delay_ms=798 elapsed=20s failed=0 target_tps=15000 total_sent=203093
+time="2026-03-28 12:04:26.294" level=info msg="Stress test progress" active=1966 completed=61667 current_tps=10533 delay_ms=840 elapsed=30s failed=0 target_tps=15000 total_sent=316006
+time="2026-03-28 12:04:36.294" level=info msg="Stress test progress" active=2000 completed=84238 current_tps=10729 delay_ms=840 elapsed=40s failed=0 target_tps=15000 total_sent=429190
+time="2026-03-28 12:04:46.295" level=info msg="Stress test progress" active=1992 completed=106926 current_tps=10851 delay_ms=840 elapsed=50s failed=0 target_tps=15000 total_sent=542592
+time="2026-03-28 12:04:56.295" level=info msg="Stress test progress" active=1990 completed=129617 current_tps=10934 delay_ms=840 elapsed=1m0s failed=0 target_tps=15000 total_sent=656051
+time="2026-03-28 12:04:56.297" level=info msg="Stress test completed" completed=129617 failed=0 final_delay_ms=840
+time="2026-03-28 12:06:41.855" level=info msg="PCAP parsing complete" pfcp_packets=10 request_packets=5 total_packets=10
+time="2026-03-28 12:06:41.856" level=info msg="UDP client pool started (8 ports)" ports="[127.0.0.1:8805 127.0.0.1:8806 127.0.0.1:8807 127.0.0.1:8808 127.0.0.1:8809 127.0.0.1:8810 127.0.0.1:8811 127.0.0.1:8812]"
+time="2026-03-28 12:06:41.858" level=info msg="Built replay plan" has_association=false heartbeats=0 messages_per_session=5 templates=1
+time="2026-03-28 12:06:41.858" level=info msg="Stress test starting" msgs_per_session=5
+time="2026-03-28 12:06:51.861" level=info msg="Stress test progress" active=1284 completed=15915 current_tps=8137 elapsed=10s failed=0 target_tps=15000 total_sent=81414
+time="2026-03-28 12:07:01.858" level=info msg="Stress test progress" active=1074 completed=33464 current_tps=8501 elapsed=20s failed=0 target_tps=15000 total_sent=170037
+time="2026-03-28 12:07:11.858" level=info msg="Stress test progress" active=1093 completed=51155 current_tps=8642 elapsed=30s failed=0 target_tps=15000 total_sent=259270
+time="2026-03-28 12:07:21.858" level=info msg="Stress test progress" active=1474 completed=68578 current_tps=8702 elapsed=40s failed=0 target_tps=15000 total_sent=348083
+time="2026-03-28 12:07:31.861" level=info msg="Stress test progress" active=1114 completed=87058 current_tps=8779 elapsed=50s failed=0 target_tps=15000 total_sent=439004
+time="2026-03-28 12:07:41.859" level=info msg="Stress test progress" active=1104 completed=105167 current_tps=8820 elapsed=1m0s failed=0 target_tps=15000 total_sent=529255
+time="2026-03-28 12:07:41.864" level=info msg="Stress test completed" completed=105170 failed=0
+time="2026-03-28 12:10:34.856" level=info msg="PCAP parsing complete" pfcp_packets=10 request_packets=5 total_packets=10
+time="2026-03-28 12:10:34.857" level=info msg="UDP client pool started (8 ports)" ports="[127.0.0.1:8805 127.0.0.1:8806 127.0.0.1:8807 127.0.0.1:8808 127.0.0.1:8809 127.0.0.1:8810 127.0.0.1:8811 127.0.0.1:8812]"
+time="2026-03-28 12:10:34.858" level=info msg="Built replay plan" has_association=false heartbeats=0 messages_per_session=5 templates=1
+time="2026-03-28 12:10:34.858" level=info msg="Stress test starting" msgs_per_session=5
+time="2026-03-28 12:10:44.858" level=info msg="Stress test progress" active=1673 completed=20546 current_tps=10671 delay_ms=0 elapsed=10s failed=0 target_tps=15000 total_sent=106732
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103936
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103937
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103938
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103939
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103940
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103941
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103942
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103943
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103944
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103945
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103946
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103947
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103948
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103949
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103950
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103951
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103952
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103953
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103954
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103955
+time="2026-03-28 12:10:49.657" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103956
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103957
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103959
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103962
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103963
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103964
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103965
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103966
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103967
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103969
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103971
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103972
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103973
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103974
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103975
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103912
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103976
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103977
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103915
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103979
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103916
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103980
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103981
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103918
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103920
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103924
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103926
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103927
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103928
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103929
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103930
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103931
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103932
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103933
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103934
+time="2026-03-28 12:10:49.658" level=warning msg="Transaction timeout, retransmitting" attempt=1 max=3 seq_num=103935
+time="2026-03-28 12:10:54.858" level=info msg="Stress test progress" active=1788 completed=41491 current_tps=10591 delay_ms=301 elapsed=20s failed=0 target_tps=15000 total_sent=211841
+time="2026-03-28 12:11:04.858" level=info msg="Stress test progress" active=1938 completed=63304 current_tps=10800 delay_ms=574 elapsed=30s failed=0 target_tps=15000 total_sent=324033
+time="2026-03-28 12:11:14.859" level=info msg="Stress test progress" active=1842 completed=85894 current_tps=10897 delay_ms=686 elapsed=40s failed=0 target_tps=15000 total_sent=435925
+time="2026-03-28 12:11:24.858" level=info msg="Stress test progress" active=1860 completed=108628 current_tps=10995 delay_ms=713 elapsed=50s failed=0 target_tps=15000 total_sent=549775
+time="2026-03-28 12:11:34.858" level=info msg="Stress test progress" active=1949 completed=130959 current_tps=11038 delay_ms=713 elapsed=1m0s failed=0 target_tps=15000 total_sent=662294
+time="2026-03-28 12:11:34.862" level=info msg="Stress test completed" completed=130966 failed=0 final_delay_ms=713
+time="2026-03-28 12:12:10.780" level=info msg="PCAP parsing complete" pfcp_packets=10 request_packets=5 total_packets=10
+time="2026-03-28 12:12:10.781" level=info msg="UDP client pool started (8 ports)" ports="[127.0.0.1:8805 127.0.0.1:8806 127.0.0.1:8807 127.0.0.1:8808 127.0.0.1:8809 127.0.0.1:8810 127.0.0.1:8811 127.0.0.1:8812]"
+time="2026-03-28 12:12:10.782" level=info msg="Built replay plan" has_association=false heartbeats=0 messages_per_session=5 templates=1
+time="2026-03-28 12:12:10.782" level=info msg="Stress test starting" msgs_per_session=5
+time="2026-03-28 12:12:20.784" level=info msg="Stress test progress" active=1335 completed=17379 current_tps=8996 delay_ms=0 elapsed=10s failed=0 target_tps=15000 total_sent=89998
+time="2026-03-28 12:12:30.782" level=info msg="Stress test progress" active=1045 completed=36007 current_tps=9093 delay_ms=129 elapsed=20s failed=0 target_tps=15000 total_sent=181882
+time="2026-03-28 12:12:40.784" level=info msg="Stress test progress" active=1811 completed=55843 current_tps=9519 delay_ms=342 elapsed=30s failed=0 target_tps=15000 total_sent=285591
+time="2026-03-28 12:12:50.784" level=info msg="Stress test progress" active=1790 completed=78294 current_tps=9930 delay_ms=567 elapsed=40s failed=0 target_tps=15000 total_sent=397241
+time="2026-03-28 12:13:00.784" level=info msg="Stress test progress" active=1990 completed=100479 current_tps=10206 delay_ms=706 elapsed=50s failed=0 target_tps=15000 total_sent=510336
+time="2026-03-28 12:13:10.783" level=info msg="Stress test progress" active=1970 completed=123067 current_tps=10385 delay_ms=778 elapsed=1m0s failed=0 target_tps=15000 total_sent=623097
+time="2026-03-28 12:13:10.785" level=info msg="Stress test completed" completed=123067 failed=0 final_delay_ms=778
+time="2026-03-28 12:13:36.751" level=info msg="PCAP parsing complete" pfcp_packets=10 request_packets=5 total_packets=10
+time="2026-03-28 12:13:36.752" level=info msg="UDP client pool started (8 ports)" ports="[127.0.0.1:8805 127.0.0.1:8806 127.0.0.1:8807 127.0.0.1:8808 127.0.0.1:8809 127.0.0.1:8810 127.0.0.1:8811 127.0.0.1:8812]"
+time="2026-03-28 12:13:36.754" level=info msg="Built replay plan" has_association=false heartbeats=0 messages_per_session=5 templates=1
+time="2026-03-28 12:13:36.754" level=info msg="Stress test starting" msgs_per_session=5
+time="2026-03-28 12:13:46.755" level=info msg="Stress test progress" active=1309 completed=15809 current_tps=8110 delay_ms=0 elapsed=10s failed=0 target_tps=15000 total_sent=81122
+time="2026-03-28 12:13:56.754" level=info msg="Stress test progress" active=1663 completed=32595 current_tps=8445 delay_ms=141 elapsed=20s failed=0 target_tps=15000 total_sent=168923
+time="2026-03-28 12:14:06.754" level=info msg="Stress test progress" active=1808 completed=53145 current_tps=9031 delay_ms=366 elapsed=30s failed=0 target_tps=15000 total_sent=270955
+time="2026-03-28 12:14:16.755" level=info msg="Stress test progress" active=1932 completed=75084 current_tps=9572 delay_ms=570 elapsed=40s failed=0 target_tps=15000 total_sent=382927
+time="2026-03-28 12:14:26.754" level=info msg="Stress test progress" active=1930 completed=97766 current_tps=9925 delay_ms=699 elapsed=50s failed=0 target_tps=15000 total_sent=496263
+time="2026-03-28 12:14:36.753" level=info msg="Stress test progress" active=1995 completed=120403 current_tps=10166 delay_ms=768 elapsed=1m0s failed=0 target_tps=15000 total_sent=609995
+time="2026-03-28 12:14:46.753" level=info msg="Stress test progress" active=1956 completed=143372 current_tps=10349 delay_ms=768 elapsed=1m10s failed=0 target_tps=15000 total_sent=724437
+time="2026-03-28 12:14:56.755" level=info msg="Stress test progress" active=1984 completed=166364 current_tps=10496 delay_ms=776 elapsed=1m20s failed=0 target_tps=15000 total_sent=839687
+time="2026-03-28 12:15:06.761" level=info msg="Stress test progress" active=1986 completed=189159 current_tps=10596 delay_ms=787 elapsed=1m30s failed=0 target_tps=15000 total_sent=953748
+time="2026-03-28 12:15:16.753" level=info msg="Stress test progress" active=2000 completed=212095 current_tps=10685 delay_ms=787 elapsed=1m40s failed=0 target_tps=15000 total_sent=1068475
+time="2026-03-28 12:15:26.753" level=info msg="Stress test progress" active=2000 completed=234860 current_tps=10748 delay_ms=787 elapsed=1m50s failed=0 target_tps=15000 total_sent=1182300
+time="2026-03-28 12:15:36.753" level=info msg="Stress test progress" active=1941 completed=257937 current_tps=10808 delay_ms=787 elapsed=2m0s failed=0 target_tps=15000 total_sent=1297008
+time="2026-03-28 12:15:46.756" level=info msg="Stress test progress" active=1977 completed=280875 current_tps=10862 delay_ms=796 elapsed=2m10s failed=0 target_tps=15000 total_sent=1412178
+time="2026-03-28 12:15:56.753" level=info msg="Stress test progress" active=1974 completed=303881 current_tps=10909 delay_ms=796 elapsed=2m20s failed=0 target_tps=15000 total_sent=1527291
+time="2026-03-28 12:16:06.753" level=info msg="Stress test progress" active=1980 completed=326330 current_tps=10929 delay_ms=818 elapsed=2m30s failed=0 target_tps=15000 total_sent=1639426
+time="2026-03-28 12:16:16.753" level=info msg="Stress test progress" active=1959 completed=349216 current_tps=10961 delay_ms=818 elapsed=2m40s failed=0 target_tps=15000 total_sent=1753781
+time="2026-03-28 12:16:26.753" level=info msg="Stress test progress" active=1997 completed=372136 current_tps=10992 delay_ms=818 elapsed=2m50s failed=0 target_tps=15000 total_sent=1868668
+time="2026-03-28 12:16:36.753" level=info msg="Stress test progress" active=1955 completed=395138 current_tps=11018 delay_ms=818 elapsed=3m0s failed=0 target_tps=15000 total_sent=1983245
+time="2026-03-28 12:16:46.753" level=info msg="Stress test progress" active=1976 completed=417837 current_tps=11037 delay_ms=818 elapsed=3m10s failed=0 target_tps=15000 total_sent=2096989
+time="2026-03-28 12:16:56.753" level=info msg="Stress test progress" active=1951 completed=440592 current_tps=11052 delay_ms=818 elapsed=3m20s failed=0 target_tps=15000 total_sent=2210501
+time="2026-03-28 12:17:06.753" level=info msg="Stress test progress" active=1954 completed=463516 current_tps=11072 delay_ms=818 elapsed=3m30s failed=0 target_tps=15000 total_sent=2325156
+time="2026-03-28 12:17:16.760" level=info msg="Stress test progress" active=1964 completed=486614 current_tps=11093 delay_ms=818 elapsed=3m40s failed=0 target_tps=15000 total_sent=2440671
+time="2026-03-28 12:17:26.752" level=info msg="Stress test progress" active=1968 completed=509165 current_tps=11102 delay_ms=818 elapsed=3m50s failed=0 target_tps=15000 total_sent=2553590
+time="2026-03-28 12:17:36.752" level=info msg="Stress test progress" active=1936 completed=532040 current_tps=11115 delay_ms=818 elapsed=4m0s failed=0 target_tps=15000 total_sent=2667606
+time="2026-03-28 12:17:46.752" level=info msg="Stress test progress" active=1919 completed=554704 current_tps=11123 delay_ms=818 elapsed=4m10s failed=0 target_tps=15000 total_sent=2780803
+time="2026-03-28 12:17:56.754" level=info msg="Stress test progress" active=1937 completed=577283 current_tps=11130 delay_ms=818 elapsed=4m20s failed=0 target_tps=15000 total_sent=2893861
+time="2026-03-28 12:18:06.754" level=info msg="Stress test progress" active=1898 completed=600147 current_tps=11140 delay_ms=818 elapsed=4m30s failed=0 target_tps=15000 total_sent=3007941
+time="2026-03-28 12:18:16.752" level=info msg="Stress test progress" active=1969 completed=622960 current_tps=11152 delay_ms=827 elapsed=4m40s failed=0 target_tps=15000 total_sent=3122517
+time="2026-03-28 12:18:26.752" level=info msg="Stress test progress" active=1979 completed=645938 current_tps=11164 delay_ms=827 elapsed=4m50s failed=0 target_tps=15000 total_sent=3237472
+time="2026-03-28 12:18:36.755" level=info msg="Stress test completed" completed=668839 failed=0 final_delay_ms=827
