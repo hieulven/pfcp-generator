@@ -34,10 +34,10 @@ func NewRateLimiter(ctx context.Context, tps float64) *RateLimiter {
 		interval = time.Millisecond
 	}
 
-	// Buffer: 2× batch size to absorb jitter
-	bufSize := batchSize * 2
-	if bufSize < 100 {
-		bufSize = 100
+	// Buffer: 4× batch size to absorb jitter and bursty consumption
+	bufSize := batchSize * 4
+	if bufSize < 200 {
+		bufSize = 200
 	}
 	tokenCh := make(chan struct{}, bufSize)
 

@@ -46,6 +46,7 @@ file, modifying session-specific identifiers, and replaying them to a target UPF
 	rootCmd.Flags().String("upf-ip", "", "Target UPF IP address")
 	rootCmd.Flags().Int("upf-port", 0, "Target UPF port")
 	rootCmd.Flags().String("ue-pool", "", "UE IPv4 address pool (CIDR)")
+	rootCmd.Flags().StringSlice("ue-pools", nil, "Multiple UE IPv4 address pools (CIDRs), comma-separated")
 	rootCmd.Flags().Uint64("seid-start", 0, "Starting SEID value")
 	rootCmd.Flags().String("seid-strategy", "", "SEID allocation strategy (sequential|random)")
 	rootCmd.Flags().Int("message-interval", -1, "Delay between messages in ms")
@@ -439,6 +440,10 @@ func bindViperFlags(v *viper.Viper, cmd *cobra.Command) {
 	if cmd.Flags().Changed("ue-pool") {
 		val, _ := cmd.Flags().GetString("ue-pool")
 		v.Set("session.ue_ip_pool", val)
+	}
+	if cmd.Flags().Changed("ue-pools") {
+		val, _ := cmd.Flags().GetStringSlice("ue-pools")
+		v.Set("session.ue_ip_pools", val)
 	}
 	if cmd.Flags().Changed("seid-start") {
 		val, _ := cmd.Flags().GetUint64("seid-start")

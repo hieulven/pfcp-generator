@@ -160,3 +160,74 @@ func TestUEIPPool_Release_UnknownIP(t *testing.T) {
 	pool.Release(net.ParseIP("10.60.0.99"))
 	assert.Equal(t, 0, pool.AllocatedCount())
 }
+
+// MultiUEIPPool tests
+
+func TestMultiUEIPPool_Basic(t *testing.T) {
+	pool, err := NewMultiUEIPPool([]string{"10.60.0.0/30", "10.61.0.0/30"})
+	require.NoError(t, err)
+	// /30 = 3 usable each, total 6
+	assert.Equal(t, 6, pool.TotalIPs())
+	assert.Equal(t, 6, pool.Available())
+}
+
+func TestMultiUEIPPool_AllocatesAcrossPools(t *testing.T) {
+	pool, err := NewMultiUEIPPool([]string{"10.60.0.0/30", "10.61.0.0/30"})
+	require.NoError(t, err)
+
+	// Exhaust first pool (3 IPs)
+	for i := 0; i < 3; i++ {
+		ip, err := pool.Allocate()
+		require.NoError(t, err)
+		assert.True(t, ip.String()[:7] == "10.60.0", "expected 10.60.0.x, got %s", ip)
+	}
+
+	// Next allocation should come from second pool
+	ip, err := pool.Allocate()
+	require.NoError(t, err)
+	assert.Equal(t, "10.61.0.1", ip.String())
+}
+
+func TestMultiUEIPPool_Exhaustion(t *testing.T) {
+	pool, err := NewMultiUEIPPool([]string{"10.60.0.0/30", "10.61.0.0/30"})
+	require.NoError(t, err)
+
+	// Allocate all 6
+	for i := 0; i < 6; i++ {
+		_, err := pool.Allocate()
+		require.NoError(t, err)
+	}
+
+	_, err = pool.Allocate()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "exhausted")
+}
+
+func TestMultiUEIPPool_ReleaseToCorrectPool(t *testing.T) {
+	pool, err := NewMultiUEIPPool([]string{"10.60.0.0/30", "10.61.0.0/30"})
+	require.NoError(t, err)
+
+	// Allocate all
+	ips := make([]net.IP, 6)
+	for i := 0; i < 6; i++ {
+		ips[i], err = pool.Allocate()
+		require.NoError(t, err)
+	}
+
+	// Release one from second pool
+	pool.Release(ips[4]) // 10.61.0.2
+	assert.Equal(t, 1, pool.Available())
+
+	// Should be able to allocate again
+	ip, err := pool.Allocate()
+	require.NoError(t, err)
+	assert.Equal(t, ips[4].String(), ip.String())
+}
+
+func TestMultiUEIPPool_EmptyCIDRs(t *testing.T) {
+	_, err := NewMultiUEIPPool(nil)
+	assert.Error(t, err)
+
+	_, err = NewMultiUEIPPool([]string{})
+	assert.Error(t, err)
+}

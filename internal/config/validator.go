@@ -45,11 +45,16 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Sprintf("pcap file not found: %s", c.Input.PcapFile))
 	}
 
-	// UE IP pool must be valid CIDR
-	if c.Session.UEIPPool == "" {
-		errs = append(errs, "session.ue_ip_pool must be specified")
-	} else if _, _, err := net.ParseCIDR(c.Session.UEIPPool); err != nil {
-		errs = append(errs, fmt.Sprintf("invalid UE IP pool CIDR %q: %v", c.Session.UEIPPool, err))
+	// UE IP pool(s) must be valid CIDR
+	pools := c.Session.AllPools()
+	if len(pools) == 0 {
+		errs = append(errs, "session.ue_ip_pool or session.ue_ip_pools must be specified")
+	} else {
+		for _, cidr := range pools {
+			if _, _, err := net.ParseCIDR(cidr); err != nil {
+				errs = append(errs, fmt.Sprintf("invalid UE IP pool CIDR %q: %v", cidr, err))
+			}
+		}
 	}
 
 	// SEID start must be > 0

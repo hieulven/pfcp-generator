@@ -147,6 +147,12 @@ func (m *Modifier) ModifySessionDeletion(
 ) error {
 	msg.Header.SetSEID(remoteSEID)
 	msg.Header.SetSequenceNumber(seqNum)
+
+	// Strip vendor-specific IEs (type >= 32768)
+	if m.stripVendorIEs {
+		msg.IEs = filterVendorIEs(msg.IEs)
+	}
+
 	return nil
 }
 

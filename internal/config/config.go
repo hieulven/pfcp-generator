@@ -37,12 +37,13 @@ type AssociationConfig struct {
 }
 
 type SessionConfig struct {
-	SEIDStart      uint64 `yaml:"seid_start"       mapstructure:"seid_start"`
-	SEIDStrategy   string `yaml:"seid_strategy"    mapstructure:"seid_strategy"`
-	UEIPPool       string `yaml:"ue_ip_pool"       mapstructure:"ue_ip_pool"`
-	StripIPv6      bool   `yaml:"strip_ipv6"       mapstructure:"strip_ipv6"`
-	StripVendorIEs bool   `yaml:"strip_vendor_ies" mapstructure:"strip_vendor_ies"`
-	CleanupOnExit  bool   `yaml:"cleanup_on_exit"  mapstructure:"cleanup_on_exit"`
+	SEIDStart      uint64   `yaml:"seid_start"       mapstructure:"seid_start"`
+	SEIDStrategy   string   `yaml:"seid_strategy"    mapstructure:"seid_strategy"`
+	UEIPPool       string   `yaml:"ue_ip_pool"       mapstructure:"ue_ip_pool"`
+	UEIPPools      []string `yaml:"ue_ip_pools"      mapstructure:"ue_ip_pools"`
+	StripIPv6      bool     `yaml:"strip_ipv6"       mapstructure:"strip_ipv6"`
+	StripVendorIEs bool     `yaml:"strip_vendor_ies" mapstructure:"strip_vendor_ies"`
+	CleanupOnExit  bool     `yaml:"cleanup_on_exit"  mapstructure:"cleanup_on_exit"`
 }
 
 type TimingConfig struct {
@@ -75,6 +76,18 @@ type StressConfig struct {
 	TPS            int  `yaml:"tps"             mapstructure:"tps"`
 	ActiveSessions int  `yaml:"active_sessions" mapstructure:"active_sessions"`
 	DurationSec    int  `yaml:"duration_sec"    mapstructure:"duration_sec"`
+}
+
+// AllPools returns the list of UE IP pool CIDRs. If UEIPPools is set, it takes
+// precedence. Otherwise the single UEIPPool value is used.
+func (s *SessionConfig) AllPools() []string {
+	if len(s.UEIPPools) > 0 {
+		return s.UEIPPools
+	}
+	if s.UEIPPool != "" {
+		return []string{s.UEIPPool}
+	}
+	return nil
 }
 
 // SetDefaults configures default values for the configuration.
@@ -144,7 +157,12 @@ func (c *Config) Summary() string {
 	sb.WriteString(fmt.Sprintf("  UPF:           %s:%d\n", c.UPF.Address, c.UPF.Port))
 	sb.WriteString(fmt.Sprintf("  Association:   enabled=%v\n", c.Association.Enabled))
 	sb.WriteString(fmt.Sprintf("  PCAP:          %s\n", c.Input.PcapFile))
-	sb.WriteString(fmt.Sprintf("  UE Pool:       %s\n", c.Session.UEIPPool))
+	pools := c.Session.AllPools()
+	if len(pools) == 1 {
+		sb.WriteString(fmt.Sprintf("  UE Pool:       %s\n", pools[0]))
+	} else {
+		sb.WriteString(fmt.Sprintf("  UE Pools:      %s (%d pools)\n", strings.Join(pools, ", "), len(pools)))
+	}
 	sb.WriteString(fmt.Sprintf("  Strip IPv6:    %v\n", c.Session.StripIPv6))
 	sb.WriteString(fmt.Sprintf("  SEID Start:    %d (%s)\n", c.Session.SEIDStart, c.Session.SEIDStrategy))
 	if c.Stress.Enabled {
