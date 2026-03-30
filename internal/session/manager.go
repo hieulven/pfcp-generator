@@ -402,12 +402,14 @@ func (m *Manager) executeStressSession(ctx context.Context, tmpl *SessionTemplat
 	// 2. Send modifications (all messages between Est and Del)
 	for i := 1; i < len(tmpl.Messages); i++ {
 		raw := tmpl.Messages[i]
+		// Check message type from raw header byte to skip deletions without
+		// a full PFCP decode. PFCP message type is at byte offset 1.
+		if len(raw.Data) > 1 && raw.Data[1] == message.MsgTypeSessionDeletionRequest {
+			continue // skip — we send our own deletion after delay
+		}
 		decoded, decErr := pfcp.Decode(raw.Data)
 		if decErr != nil {
 			continue
-		}
-		if decoded.MessageType() == message.MsgTypeSessionDeletionRequest {
-			continue // skip — we send our own deletion after delay
 		}
 		if err := rateLimiter.Wait(ctx); err != nil {
 			m.cleanupStressSession(ctx, session)
