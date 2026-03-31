@@ -407,60 +407,107 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 		}
 	}()
 
-	// Workers are I/O-bound (each blocks in waitForResult per message), not CPU-bound.
+	// Workers are I/O-bound: each blocks in waitForResult for one network RTT
+	// per message. Required workers = targetTPS × avgRTT_seconds.
+	// Under a loaded UPF, RTT can be 50-200ms — far above any static estimate.
+	// We start with a modest pool and autoscale based on observed utilization.
 	//
-	// Required workers = targetTPS × maxRTT_seconds.
-	// Derivation: at steady state there are TPS × RTT messages in flight.
-	// Each worker handles one message at a time (sequential within a session),
-	// so we need exactly that many workers to sustain the target rate.
-	//
-	// Example: 40K TPS × 10ms RTT = 400 workers.
-	// activeSessions (up to 300K) is irrelevant to worker sizing — it only
+	// activeSessions (up to 300K) is irrelevant to worker sizing; it only
 	// affects the semaphore, deletion heap, and session maps.
-	//
-	// We use 15ms as a conservative RTT estimate (covers stated max of 10ms
-	// plus scheduling jitter) and add 2× headroom for burst tolerance.
-	const conservativeRTTsec = 0.015
-	numWorkers := int(tps*conservativeRTTsec) * 2
-	if numWorkers < runtime.NumCPU()*4 {
-		numWorkers = runtime.NumCPU() * 4
+	const (
+		maxWorkers       = 8000  // 40K TPS × 200ms RTT = 8K workers maximum
+		scaleUpThreshold = 0.85  // scale up when >85% of workers waiting on network
+		scaleInterval    = 3 * time.Second
+	)
+	initialWorkers := int(tps * 0.030) // seed with 30ms RTT estimate
+	if initialWorkers < runtime.NumCPU()*4 {
+		initialWorkers = runtime.NumCPU() * 4
 	}
-	if numWorkers > 4000 {
-		numWorkers = 4000
+	if initialWorkers > maxWorkers {
+		initialWorkers = maxWorkers
 	}
 
-	log.WithFields(log.Fields{
-		"num_workers":     numWorkers,
-		"active_sessions": activeSessions,
-		"target_tps":      tps,
-	}).Info("Starting stress workers")
-
+	var activeWorkerCount atomic.Int64
 	var wg sync.WaitGroup
-	wg.Add(numWorkers)
 
-	for w := 0; w < numWorkers; w++ {
+	// spawnWorker starts one worker goroutine that drains workCh.
+	spawnWorker := func() {
+		wg.Add(1)
+		activeWorkerCount.Add(1)
 		go func() {
 			defer wg.Done()
+			defer activeWorkerCount.Add(-1)
 			for tmplIdx := range workCh {
 				tmpl := &preEncoded[tmplIdx]
 				err := m.executeStressSession(testCtx, tmpl, rateLimiter, delay, pendingCh,
 					&workersBlockedRate, &workersBlockedNet)
 				if err != nil {
 					if testCtx.Err() != nil {
-						// Context cancelled: release semaphore since dispatcher won't see this session.
 						<-sem
 						return
 					}
 					failedSessions.Add(1)
 					log.WithError(err).Debug("Session failed")
-					<-sem // Release semaphore on error (deletion dispatcher won't be called)
+					<-sem
 				} else {
 					completedSessions.Add(1)
-					// Semaphore is released by the deletion dispatcher, not here.
 				}
 			}
 		}()
 	}
+
+	log.WithFields(log.Fields{
+		"initial_workers": initialWorkers,
+		"max_workers":     maxWorkers,
+		"active_sessions": activeSessions,
+		"target_tps":      tps,
+	}).Info("Starting stress workers")
+
+	for w := 0; w < initialWorkers; w++ {
+		spawnWorker()
+	}
+
+	// Autoscaler: every scaleInterval, measure worker utilization
+	// (workersBlockedNet / activeWorkerCount). If >85% of workers are waiting
+	// on the network, all workers are saturated and more are needed.
+	// This handles loaded-UPF environments where RTT is 50-200ms+ at scale.
+	go func() {
+		ticker := time.NewTicker(scaleInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-testCtx.Done():
+				return
+			case <-ticker.C:
+				cur := activeWorkerCount.Load()
+				if cur <= 0 || cur >= maxWorkers {
+					continue
+				}
+				net := workersBlockedNet.Load()
+				utilization := float64(net) / float64(cur)
+				if utilization < scaleUpThreshold {
+					continue
+				}
+				// Measured avg RTT = workers_net / current_tps.
+				// Required workers = targetTPS * avgRTT. Add 20% more.
+				toAdd := int64(float64(cur) * 0.20)
+				if toAdd < 4 {
+					toAdd = 4
+				}
+				if cur+toAdd > maxWorkers {
+					toAdd = maxWorkers - cur
+				}
+				for i := int64(0); i < toAdd; i++ {
+					spawnWorker()
+				}
+				log.WithFields(log.Fields{
+					"added":       toAdd,
+					"total":       cur + toAdd,
+					"utilization": fmt.Sprintf("%.0f%%", utilization*100),
+				}).Info("Autoscaled worker pool")
+			}
+		}
+	}()
 
 	wg.Wait()
 
