@@ -10,6 +10,54 @@ import (
 	"pfcp-generator/pkg/types"
 )
 
+// PreEncodedTemplate holds pre-encoded PFCP messages for stress mode hot path.
+// Instead of decode→modify→encode per session, workers copy the pre-encoded bytes
+// and patch only the per-session variable fields (SEID, UE IP, seq num) in-place.
+type PreEncodedTemplate struct {
+	EstMsg  *pfcp.PreEncodedMsg   // pre-encoded Session Establishment Request
+	ModMsgs []*pfcp.PreEncodedMsg // pre-encoded Session Modification Requests (no deletions)
+}
+
+// BuildPreEncodedTemplates pre-encodes each SessionTemplate's messages using modifier.
+// Templates that fail to pre-encode are silently dropped (caller should check len).
+func BuildPreEncodedTemplates(templates []SessionTemplate, modifier *pfcp.Modifier) []PreEncodedTemplate {
+	result := make([]PreEncodedTemplate, 0, len(templates))
+	for i := range templates {
+		tmpl := &templates[i]
+		if len(tmpl.Messages) == 0 {
+			continue
+		}
+
+		// Pre-encode establishment (first message)
+		estPre, err := pfcp.PreEncodeEstablishment(modifier, tmpl.Messages[0].Data)
+		if err != nil {
+			log.WithError(err).WithField("template", i).Warn("Failed to pre-encode establishment, skipping template")
+			continue
+		}
+
+		// Pre-encode modification messages (skip establishment and deletion)
+		var modPres []*pfcp.PreEncodedMsg
+		for j := 1; j < len(tmpl.Messages); j++ {
+			raw := tmpl.Messages[j]
+			if len(raw.Data) > 1 && raw.Data[1] == message.MsgTypeSessionDeletionRequest {
+				continue
+			}
+			modPre, err := pfcp.PreEncodeModification(modifier, raw.Data)
+			if err != nil {
+				log.WithError(err).WithField("template", i).WithField("msg", j).Debug("Failed to pre-encode modification, skipping")
+				continue
+			}
+			modPres = append(modPres, modPre)
+		}
+
+		result = append(result, PreEncodedTemplate{
+			EstMsg:  estPre,
+			ModMsgs: modPres,
+		})
+	}
+	return result
+}
+
 // SessionTemplate represents a complete session lifecycle extracted from a pcap:
 // Association (optional) + Establishment + N×Modification + Deletion (optional).
 type SessionTemplate struct {

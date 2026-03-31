@@ -1,10 +1,12 @@
 package session
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
 	"math/rand"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +21,28 @@ import (
 	"pfcp-generator/internal/stats"
 	"pfcp-generator/pkg/types"
 )
+
+// pendingSession is a session that has completed its lifecycle messages and is
+// waiting for its adaptive delay to expire before deletion is sent.
+type pendingSession struct {
+	session  *types.SessionInfo
+	deleteAt time.Time
+}
+
+// pendingHeap is a min-heap of pendingSession ordered by deleteAt.
+type pendingHeap []pendingSession
+
+func (h pendingHeap) Len() int            { return len(h) }
+func (h pendingHeap) Less(i, j int) bool  { return h[i].deleteAt.Before(h[j].deleteAt) }
+func (h pendingHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *pendingHeap) Push(x interface{}) { *h = append(*h, x.(pendingSession)) }
+func (h *pendingHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
 
 // Manager orchestrates the PFCP session replay workflow.
 type Manager struct {
@@ -225,10 +249,25 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 	}
 	defer testCancel()
 
-	// Session semaphore: limits concurrent active sessions
+	// Pre-encode all templates once at startup (Change 3).
+	// Workers use byte-copy + field patching instead of decode→modify→encode per session.
+	preEncoded := BuildPreEncodedTemplates(plan.Templates, m.modifier)
+	if len(preEncoded) == 0 {
+		return fmt.Errorf("no templates could be pre-encoded")
+	}
+	log.WithField("templates", len(preEncoded)).Info("Pre-encoded session templates")
+
+	// Session semaphore: limits concurrent active sessions.
+	// Released by the deletion dispatcher (not by workers) so it remains held
+	// for the full session lifetime: establish → modifications → delay → delete.
 	sem := make(chan struct{}, activeSessions)
 
-	// Work channel
+	// pendingCh carries sessions that have finished their lifecycle messages and
+	// are waiting for the adaptive delay before deletion. The deletion dispatcher
+	// manages the timer-heap and fires deletions without holding worker goroutines.
+	pendingCh := make(chan pendingSession, activeSessions)
+
+	// Work channel: just a template index.
 	workCh := make(chan int, activeSessions)
 
 	// Adaptive delay: starts at 0, calibrated after warmup
@@ -323,10 +362,18 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 		}
 	}()
 
-	// Feeder goroutine
+	// Deletion dispatcher (Change 2): one goroutine manages a min-heap of sessions
+	// ordered by deletion time. When a session is due, it spawns a short-lived
+	// goroutine to send the deletion and release the semaphore. This replaces the
+	// previous design where each worker goroutine slept for the adaptive delay,
+	// causing up to 10K sleeping goroutines to consume scheduler slots.
+	go m.runDeletionDispatcher(testCtx, pendingCh, sem, rateLimiter, &failedSessions)
+
+	// Feeder goroutine: acquires a semaphore slot then queues a template index.
+	// Semaphore is released by the deletion dispatcher after deletion completes.
 	go func() {
 		defer close(workCh)
-		templateCount := len(plan.Templates)
+		templateCount := len(preEncoded)
 		idx := 0
 		for {
 			select {
@@ -344,10 +391,13 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 		}
 	}()
 
-	// Start workers
-	numWorkers := activeSessions
-	if numWorkers > 10000 {
-		numWorkers = 10000
+	// Change 1: Use runtime.NumCPU()*4 workers instead of activeSessions.
+	// The semaphore still caps active sessions at the target; fewer goroutines
+	// means drastically less scheduler pressure. Workers spend their time doing
+	// real work (network I/O) rather than sleeping for the adaptive delay.
+	numWorkers := runtime.NumCPU() * 4
+	if numWorkers < 16 {
+		numWorkers = 16
 	}
 	var wg sync.WaitGroup
 	wg.Add(numWorkers)
@@ -356,19 +406,21 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 		go func() {
 			defer wg.Done()
 			for tmplIdx := range workCh {
-				tmpl := &plan.Templates[tmplIdx]
-				err := m.executeStressSession(testCtx, tmpl, rateLimiter, delay)
+				tmpl := &preEncoded[tmplIdx]
+				err := m.executeStressSession(testCtx, tmpl, rateLimiter, delay, pendingCh)
 				if err != nil {
 					if testCtx.Err() != nil {
+						// Context cancelled: release semaphore since dispatcher won't see this session.
 						<-sem
 						return
 					}
 					failedSessions.Add(1)
 					log.WithError(err).Debug("Session failed")
+					<-sem // Release semaphore on error (deletion dispatcher won't be called)
 				} else {
 					completedSessions.Add(1)
+					// Semaphore is released by the deletion dispatcher, not here.
 				}
-				<-sem // Release semaphore slot
 			}
 		}()
 	}
@@ -384,38 +436,115 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 	return nil
 }
 
-// executeStressSession runs a full session lifecycle: Est → Mods → delay → Del.
-func (m *Manager) executeStressSession(ctx context.Context, tmpl *SessionTemplate, rateLimiter *RateLimiter, delay *adaptiveDelay) error {
-	if len(tmpl.Messages) == 0 {
-		return fmt.Errorf("empty template")
+// runDeletionDispatcher manages deferred session deletions using a min-heap.
+// Sessions arrive via pendingCh with a target deleteAt time. The dispatcher
+// wakes up when the earliest session is due, then spawns a short goroutine to
+// send the deletion and release the semaphore. This reduces O(activeSessions)
+// sleeping goroutines to O(1) goroutine + a heap, dramatically cutting scheduler load.
+func (m *Manager) runDeletionDispatcher(
+	ctx context.Context,
+	pendingCh <-chan pendingSession,
+	sem chan struct{},
+	rateLimiter *RateLimiter,
+	failedSessions *atomic.Uint64,
+) {
+	h := &pendingHeap{}
+	heap.Init(h)
+
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	var timerArmed bool
+
+	armTimer := func(d time.Duration) {
+		if timerArmed {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+		if d < 0 {
+			d = 0
+		}
+		timer.Reset(d)
+		timerArmed = true
 	}
 
+	for {
+		select {
+		case <-ctx.Done():
+			// Drain remaining sessions: release semaphore slots without sending deletion.
+			for h.Len() > 0 {
+				heap.Pop(h)
+				<-sem
+			}
+			return
+
+		case pd, ok := <-pendingCh:
+			if !ok {
+				return
+			}
+			heap.Push(h, pd)
+			// Re-arm timer for the earliest due session.
+			armTimer(time.Until((*h)[0].deleteAt))
+
+		case <-timer.C:
+			timerArmed = false
+			now := time.Now()
+			for h.Len() > 0 && !(*h)[0].deleteAt.After(now) {
+				pd := heap.Pop(h).(pendingSession)
+				// Short-lived deletion goroutine: does real network I/O then releases semaphore.
+				// At 10K TPS with ~1ms RTT there are only ~10 of these in flight at steady state.
+				go func(s *types.SessionInfo) {
+					defer func() { <-sem }()
+					if err := rateLimiter.Wait(ctx); err != nil {
+						m.releaseSession(s)
+						return
+					}
+					if err := m.sendSessionDeletion(ctx, s); err != nil && ctx.Err() == nil {
+						failedSessions.Add(1)
+						m.releaseSession(s)
+					}
+				}(pd.session)
+			}
+			// Re-arm for next due session, if any.
+			if h.Len() > 0 {
+				armTimer(time.Until((*h)[0].deleteAt))
+			}
+		}
+	}
+}
+
+// executeStressSession runs a session lifecycle using pre-encoded byte templates:
+// Est → Mods → push to pendingCh (for deferred deletion by dispatcher).
+// Workers return immediately after pushing to pendingCh; the adaptive delay is
+// handled by the deletion dispatcher's timer-heap, not by the worker goroutine.
+func (m *Manager) executeStressSession(
+	ctx context.Context,
+	tmpl *PreEncodedTemplate,
+	rateLimiter *RateLimiter,
+	delay *adaptiveDelay,
+	pendingCh chan<- pendingSession,
+) error {
 	// 1. Establish
 	if err := rateLimiter.Wait(ctx); err != nil {
 		return err
 	}
-	session, err := m.establishFromRaw(ctx, tmpl.Messages[0])
+	session, err := m.establishFromPreEncoded(ctx, tmpl.EstMsg)
 	if err != nil {
 		return err
 	}
 
-	// 2. Send modifications (all messages between Est and Del)
-	for i := 1; i < len(tmpl.Messages); i++ {
-		raw := tmpl.Messages[i]
-		// Check message type from raw header byte to skip deletions without
-		// a full PFCP decode. PFCP message type is at byte offset 1.
-		if len(raw.Data) > 1 && raw.Data[1] == message.MsgTypeSessionDeletionRequest {
-			continue // skip — we send our own deletion after delay
-		}
-		decoded, decErr := pfcp.Decode(raw.Data)
-		if decErr != nil {
-			continue
-		}
+	// 2. Send modifications using pre-encoded byte templates (Change 3).
+	for _, modMsg := range tmpl.ModMsgs {
 		if err := rateLimiter.Wait(ctx); err != nil {
 			m.cleanupStressSession(ctx, session)
 			return err
 		}
-		if err := m.handleSessionModificationDirect(ctx, decoded, session); err != nil {
+		if err := m.sendPreEncodedModification(ctx, modMsg, session); err != nil {
 			if ctx.Err() != nil {
 				m.cleanupStressSession(ctx, session)
 				return err
@@ -424,31 +553,152 @@ func (m *Manager) executeStressSession(ctx context.Context, tmpl *SessionTemplat
 		}
 	}
 
-	// 3. Adaptive delay with jitter — hold the session active
+	// 3. Push to deletion dispatcher with jittered delay.
+	// Worker returns immediately; deletion happens asynchronously.
 	d := delay.Get()
+	deleteAt := time.Now()
 	if d > 0 {
-		jittered := time.Duration(float64(d) * (0.5 + rand.Float64()))
-		select {
-		case <-ctx.Done():
-			m.cleanupStressSession(ctx, session)
-			return ctx.Err()
-		case <-time.After(jittered):
-		}
+		deleteAt = deleteAt.Add(time.Duration(float64(d) * (0.5 + rand.Float64())))
 	}
-
-	// 4. Delete
-	if err := rateLimiter.Wait(ctx); err != nil {
+	select {
+	case pendingCh <- pendingSession{session: session, deleteAt: deleteAt}:
+		return nil
+	case <-ctx.Done():
 		m.cleanupStressSession(ctx, session)
-		return err
+		return ctx.Err()
 	}
-	if err := m.sendSessionDeletion(ctx, session); err != nil {
-		if ctx.Err() != nil {
-			return err
-		}
-		m.releaseSession(session)
-		return err
+}
+
+// establishFromPreEncoded sends a pre-encoded Session Establishment Request,
+// patches per-session fields (localSEID, UE IP, seq) by byte-copying the template,
+// and waits for the UPF response to extract the remote SEID.
+func (m *Manager) establishFromPreEncoded(ctx context.Context, pre *pfcp.PreEncodedMsg) (*types.SessionInfo, error) {
+	localSEID, err := m.seidAlloc.Allocate()
+	if err != nil {
+		m.stats.RecordSessionFailed()
+		return nil, fmt.Errorf("failed to allocate SEID: %w", err)
 	}
 
+	ueIP, err := m.ipPool.Allocate()
+	if err != nil {
+		m.seidAlloc.Release(localSEID)
+		m.stats.RecordSessionFailed()
+		return nil, fmt.Errorf("failed to allocate UE IP: %w", err)
+	}
+
+	session := &types.SessionInfo{
+		LocalSEID: localSEID,
+		UEIP:      ueIP,
+		State:     "establishing",
+		CreatedAt: time.Now(),
+	}
+
+	m.mu.Lock()
+	m.byLocalSEID[localSEID] = session
+	m.mu.Unlock()
+
+	seqNum := m.seqCounter.Next()
+
+	// Byte-copy template and patch per-session fields. No PFCP decode/encode needed.
+	data := make([]byte, len(pre.Data))
+	pre.ApplyInto(data, seqNum, 0 /* header SEID=0 for establishment */, localSEID /* CP-FSEID SEID */, ueIP)
+
+	msgTypeName := "SessionEstablishmentRequest"
+	m.stats.RecordSent(msgTypeName)
+	portIdx := m.pool.NextPortIndex()
+	resultCh := m.tracker.Track(seqNum, data, portIdx)
+
+	if err := m.pool.SendOn(portIdx, data); err != nil {
+		return nil, fmt.Errorf("failed to send Session Establishment: %w", err)
+	}
+
+	result := m.waitForResult(ctx, resultCh)
+	if result.Error != nil {
+		m.stats.RecordTimeout(msgTypeName)
+		m.stats.RecordSessionFailed()
+		session.State = "failed"
+		return nil, fmt.Errorf("Session Establishment timeout: %w", result.Error)
+	}
+
+	m.stats.RecordReceived("SessionEstablishmentResponse")
+
+	// Parse response to extract the UPF-assigned remote SEID.
+	respMsg, err := pfcp.Decode(result.Response)
+	if err != nil {
+		m.stats.RecordFailure(msgTypeName)
+		m.stats.RecordSessionFailed()
+		return nil, fmt.Errorf("failed to decode Establishment Response: %w", err)
+	}
+
+	resp, ok := respMsg.(*message.SessionEstablishmentResponse)
+	if !ok {
+		m.stats.RecordFailure(msgTypeName)
+		m.stats.RecordSessionFailed()
+		return nil, fmt.Errorf("unexpected response type: %T", respMsg)
+	}
+
+	if resp.Cause != nil {
+		cause, cErr := resp.Cause.Cause()
+		if cErr == nil && cause != ie.CauseRequestAccepted {
+			m.stats.RecordFailure(msgTypeName)
+			m.stats.RecordSessionFailed()
+			session.State = "failed"
+			return nil, fmt.Errorf("Session Establishment rejected with cause %d", cause)
+		}
+	}
+
+	remoteSEID, err := pfcp.ExtractRemoteSEID(resp)
+	if err != nil {
+		m.stats.RecordFailure(msgTypeName)
+		m.stats.RecordSessionFailed()
+		return nil, fmt.Errorf("failed to extract remote SEID: %w", err)
+	}
+
+	m.mu.Lock()
+	session.RemoteSEID = remoteSEID
+	session.State = "established"
+	m.mu.Unlock()
+
+	m.stats.RecordSuccess(msgTypeName, result.ResponseTime)
+	m.stats.RecordSessionEstablished()
+
+	log.WithFields(log.Fields{
+		"seq_num":       seqNum,
+		"local_seid":    localSEID,
+		"remote_seid":   remoteSEID,
+		"ue_ip":         ueIP,
+		"response_time": result.ResponseTime.Round(time.Microsecond),
+	}).Debug("Session established")
+
+	return session, nil
+}
+
+// sendPreEncodedModification sends a pre-encoded Session Modification Request,
+// patching the header SEID (remoteSEID), UE IP, and seq num by byte-copying the template.
+func (m *Manager) sendPreEncodedModification(ctx context.Context, pre *pfcp.PreEncodedMsg, session *types.SessionInfo) error {
+	seqNum := m.seqCounter.Next()
+
+	data := make([]byte, len(pre.Data))
+	pre.ApplyInto(data, seqNum, session.RemoteSEID, 0 /* no CP-FSEID in modifications */, session.UEIP)
+
+	msgTypeName := "SessionModificationRequest"
+	m.stats.RecordSent(msgTypeName)
+	portIdx := m.pool.NextPortIndex()
+	resultCh := m.tracker.Track(seqNum, data, portIdx)
+
+	if err := m.pool.SendOn(portIdx, data); err != nil {
+		return fmt.Errorf("failed to send Session Modification: %w", err)
+	}
+
+	result := m.waitForResult(ctx, resultCh)
+	if result.Error != nil {
+		m.stats.RecordTimeout(msgTypeName)
+		return fmt.Errorf("Session Modification timeout: %w", result.Error)
+	}
+
+	m.stats.RecordReceived("SessionModificationResponse")
+	m.stats.RecordSuccess(msgTypeName, result.ResponseTime)
+	m.stats.RecordSessionModified()
 	return nil
 }
 
