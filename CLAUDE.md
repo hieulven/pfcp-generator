@@ -44,7 +44,7 @@ The tool acts as an **SMF (Session Management Function)** that replays PFCP traf
 - **`internal/config/`** — Config structs loaded from `config.yaml`, with CLI flag overrides; validated in `validator.go`
 - **`internal/pcap/`** — Parses pcap/pcapng files via `google/gopacket`, filters UDP port 8805, returns PFCP requests
 - **`internal/pfcp/`** — Decodes/encodes PFCP messages using `wmnsk/go-pfcp`; `modifier.go` replaces F-SEID, UE IP, sequence numbers while preserving PDR/FAR/QER/URR/BAR IDs; strips vendor-specific IEs (type >= 32768) when configured
-- **`internal/session/`** — `manager.go` drives session lifecycle (Replay + ReplayStress modes); `grouper.go` groups pcap messages into session templates; `ratelimiter.go` provides batch-ticker rate limiting; `seid_allocator.go` uses atomic counter + free-list; `ip_pool.go` uses free-list stack for O(1) UE IP allocation
+- **`internal/session/`** — `manager.go` drives session lifecycle (Replay + ReplayStress modes); `grouper.go` groups pcap messages into session templates; `ratelimiter.go` provides wall-clock catch-up rate limiting; `seid_allocator.go` uses atomic counter + free-list; `ip_pool.go` uses free-list stack for O(1) UE IP allocation
 - **`internal/network/`** — Multi-source-port UDP client pool (`pool.go`), lock-free UDP client (`sender.go`), multi-conn async receiver with `sync.Pool` buffers (`receiver.go`), 64-shard transaction tracker with port-aware retransmission (`transaction.go`)
 - **`internal/stats/`** — Metrics collection, console/JSON reporting, and live TUI dashboard for stress mode
 - **`pkg/types/`** — Shared types: `RawPFCPMessage`, `SessionInfo`, `TransactionResult`

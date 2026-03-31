@@ -137,7 +137,7 @@ The PFCP Message Generator is a Go application that emulates an SMF node by repl
 | Transactions | 64-shard map, port-aware retransmission | 64× less contention |
 | IP Pool | `[]uint32` free-list stack | O(1) alloc/release, no strings |
 | SEID Alloc | `atomic.Uint64` counter + free-list | Lock-free fast path |
-| Rate Limiter | Batch ticker (50 tokens/ms at 50K TPS) | Reliable at high rates |
+| Rate Limiter | Wall-clock catch-up ticker (recovers dropped ticks under goroutine load) | Reliable at 40K+ TPS |
 | Sequence Counter | `atomic.Uint32` | Lock-free |
 | Modifier | Vendor IE stripping (type >= 32768) | Clean messages to UPF |
 
@@ -175,7 +175,7 @@ pfcp-generator/
 │   ├── session/
 │   │   ├── manager.go                 # Session lifecycle: Replay + ReplayStress
 │   │   ├── grouper.go                 # Groups pcap messages into SessionTemplates
-│   │   ├── ratelimiter.go            # Batch-ticker rate limiter for high TPS
+│   │   ├── ratelimiter.go            # Wall-clock catch-up rate limiter for high TPS
 │   │   ├── seid_allocator.go          # Atomic counter + free-list SEID allocation
 │   │   └── ip_pool.go                # Free-list stack UE IP allocation
 │   ├── network/
@@ -567,7 +567,7 @@ Main Goroutine
 │   └── Release semaphore slot on session completion
 │
 ├── Rate Limiter Goroutine
-│   └── Batch ticker: produces batchSize tokens per tick (e.g., 50 tokens/ms at 50K TPS)
+│   └── Wall-clock catch-up: computes expected tokens from elapsed time, recovers missed ticks
 │
 ├── Receiver Goroutines (1 per source port)
 │   ├── ReadFromUDP with sync.Pool buffer reuse

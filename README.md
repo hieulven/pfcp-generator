@@ -117,7 +117,7 @@ The tool groups pcap messages into session templates (Establishment + Modificati
 - 64-shard transaction tracker to reduce lock contention
 - Atomic counters + fixed-bucket histogram for stats (constant memory)
 - `sync.Pool` for receive buffer reuse
-- Batch-ticker rate limiter (50 tokens/ms at 50K TPS)
+- Wall-clock catch-up rate limiter (recovers tokens lost to Go scheduler delays)
 - Free-list based IP pool and SEID allocator (O(1) allocate/release)
 - Live terminal dashboard with 1-second refresh (TPS, sessions, response times, per-message-type stats)
 - Logs auto-redirect to file (`pfcp-generator.log`) to keep the terminal clean
@@ -412,7 +412,7 @@ internal/
   session/
     manager.go         Session orchestration (Replay + ReplayStress)
     grouper.go         Groups pcap messages into session templates
-    ratelimiter.go     Batch-ticker rate limiter for high TPS
+    ratelimiter.go     Wall-clock catch-up rate limiter for high TPS
     ip_pool.go         Free-list based UE IP allocation
     seid_allocator.go  Atomic counter + free-list SEID allocation
   stats/
