@@ -255,7 +255,16 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 	if len(preEncoded) == 0 {
 		return fmt.Errorf("no templates could be pre-encoded")
 	}
-	log.WithField("templates", len(preEncoded)).Info("Pre-encoded session templates")
+
+	// Pre-encode a deletion template once. Deletion requests are header-only (SEID + seq).
+	preEncodedDel, err := pfcp.PreEncodeDeletion()
+	if err != nil {
+		return fmt.Errorf("failed to pre-encode deletion template: %w", err)
+	}
+	log.WithFields(log.Fields{
+		"templates":     len(preEncoded),
+		"deletion_size": len(preEncodedDel.Data),
+	}).Info("Pre-encoded session templates")
 
 	// Session semaphore: limits concurrent active sessions.
 	// Released by the deletion dispatcher (not by workers) so it remains held
@@ -286,13 +295,35 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 	var workersBlockedRate atomic.Int64  // inside rateLimiter.Wait
 	var pendingDelSize atomic.Int64      // sessions queued for deletion
 
-	// Calibrator goroutine: adjusts delay after warmup to keep active sessions at target
+	// Compute steady-state target delay from session dynamics.
+	// At steady state: active ≈ creation_rate × session_lifetime
+	// session_lifetime ≈ delay + overhead (RTT for est + del)
+	// creation_rate ≈ tps / msgs_per_lifecycle
+	// Solving for delay: delay ≈ active / creation_rate
+	totalMsgsPerLifecycle := 0
+	for _, t := range preEncoded {
+		totalMsgsPerLifecycle += 1 + len(t.ModMsgs) + 1 // est + mods + auto-del
+	}
+	avgMsgsPerLifecycle := float64(totalMsgsPerLifecycle) / float64(len(preEncoded))
+	steadyCreationRate := tps / avgMsgsPerLifecycle
+	steadyTargetDelay := time.Duration(float64(time.Second) * float64(activeSessions) / steadyCreationRate)
+
+	log.WithFields(log.Fields{
+		"target_delay_ms":      steadyTargetDelay.Milliseconds(),
+		"msgs_per_lifecycle":   fmt.Sprintf("%.1f", avgMsgsPerLifecycle),
+		"steady_creation_rate": fmt.Sprintf("%.0f", steadyCreationRate),
+	}).Info("Computed steady-state target delay")
+
+	// Calibrator goroutine: two-phase approach.
+	// Phase 1 (far from target): exponential convergence toward computed target delay
+	//   — moves 30% of the gap per tick, reaching ~97% in 5 seconds.
+	// Phase 2 (near target): proportional fine-tuning to hold active sessions at target.
 	go func() {
-		// Warmup: let sessions fill up before calibrating
+		// Warmup: let initial sessions establish before calibrating.
 		select {
 		case <-testCtx.Done():
 			return
-		case <-time.After(10 * time.Second):
+		case <-time.After(5 * time.Second):
 		}
 
 		ticker := time.NewTicker(500 * time.Millisecond)
@@ -307,24 +338,33 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 				current := delay.Get()
 				errorRatio := float64(target-actual) / float64(target)
 
-				// Dead band: ±5% — don't adjust for small fluctuations
-				if errorRatio > -0.05 && errorRatio < 0.05 {
+				// Dead band: ±2%
+				if errorRatio > -0.02 && errorRatio < 0.02 {
 					continue
 				}
 
-				// Proportional + additive adjustment (conservative gains)
-				propAdj := time.Duration(float64(current) * errorRatio * 0.2)
-				addAdj := time.Duration(float64(20*time.Millisecond) * errorRatio)
-				adjustment := propAdj + addAdj
-
-				maxAdj := 200 * time.Millisecond
-				if adjustment > maxAdj {
-					adjustment = maxAdj
-				} else if adjustment < -maxAdj {
-					adjustment = -maxAdj
+				var newDelay time.Duration
+				if errorRatio > 0.10 {
+					// Phase 1: far from target — converge toward steady-state delay.
+					// 30% of gap per tick → ~97% converged in 10 ticks (5 seconds).
+					step := time.Duration(float64(steadyTargetDelay-current) * 0.30)
+					newDelay = current + step
+				} else {
+					// Phase 2: near target — proportional fine-tuning.
+					// maxAdj scales with target delay (5% per tick) for large targets.
+					adjustment := time.Duration(float64(current) * errorRatio * 0.3)
+					maxAdj := time.Duration(float64(steadyTargetDelay) * 0.05)
+					if maxAdj < 200*time.Millisecond {
+						maxAdj = 200 * time.Millisecond
+					}
+					if adjustment > maxAdj {
+						adjustment = maxAdj
+					} else if adjustment < -maxAdj {
+						adjustment = -maxAdj
+					}
+					newDelay = current + adjustment
 				}
 
-				newDelay := current + adjustment
 				if newDelay < 0 {
 					newDelay = 0
 				}
@@ -383,7 +423,7 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 	// goroutine to send the deletion and release the semaphore. This replaces the
 	// previous design where each worker goroutine slept for the adaptive delay,
 	// causing up to 10K sleeping goroutines to consume scheduler slots.
-	go m.runDeletionDispatcher(testCtx, pendingCh, sem, rateLimiter, &failedSessions, &pendingDelSize)
+	go m.runDeletionDispatcher(testCtx, pendingCh, sem, rateLimiter, preEncodedDel, &failedSessions, &pendingDelSize)
 
 	// Feeder goroutine: acquires a semaphore slot then queues a template index.
 	// Semaphore is released by the deletion dispatcher after deletion completes.
@@ -408,17 +448,27 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 	}()
 
 	// Workers are I/O-bound: each blocks in waitForResult for one network RTT
-	// per message. Required workers = targetTPS × avgRTT_seconds.
+	// per message. Required workers ≈ targetTPS × avgRTT_seconds.
 	// Under a loaded UPF, RTT can be 50-200ms — far above any static estimate.
-	// We start with a modest pool and autoscale based on observed utilization.
+	// We start with a modest pool and autoscale aggressively based on observed
+	// network utilization, computing needed workers directly instead of growing
+	// incrementally.
 	//
 	// activeSessions (up to 300K) is irrelevant to worker sizing; it only
 	// affects the semaphore, deletion heap, and session maps.
 	const (
-		maxWorkers       = 8000  // 40K TPS × 200ms RTT = 8K workers maximum
-		scaleUpThreshold = 0.85  // scale up when >85% of workers waiting on network
-		scaleInterval    = 3 * time.Second
+		scaleUpThreshold = 0.80  // scale up when >80% of workers waiting on network
+		scaleInterval    = 2 * time.Second
 	)
+	// Dynamic max: support target TPS at up to 200ms average RTT with 50% headroom.
+	// Fewer idle goroutines = less scheduler overhead = higher actual throughput.
+	maxWorkers := int(tps * 0.3)
+	if maxWorkers < 2000 {
+		maxWorkers = 2000
+	}
+	if maxWorkers > 12000 {
+		maxWorkers = 12000
+	}
 	initialWorkers := int(tps * 0.030) // seed with 30ms RTT estimate
 	if initialWorkers < runtime.NumCPU()*4 {
 		initialWorkers = runtime.NumCPU() * 4
@@ -468,9 +518,9 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 	}
 
 	// Autoscaler: every scaleInterval, measure worker utilization
-	// (workersBlockedNet / activeWorkerCount). If >85% of workers are waiting
-	// on the network, all workers are saturated and more are needed.
-	// This handles loaded-UPF environments where RTT is 50-200ms+ at scale.
+	// (workersBlockedNet / activeWorkerCount). If >80% of workers are waiting
+	// on the network, compute the needed worker count directly from the current
+	// in-flight count and scale in one step instead of growing incrementally.
 	go func() {
 		ticker := time.NewTicker(scaleInterval)
 		defer ticker.Stop()
@@ -480,22 +530,28 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 				return
 			case <-ticker.C:
 				cur := activeWorkerCount.Load()
-				if cur <= 0 || cur >= maxWorkers {
+				if cur <= 0 || cur >= int64(maxWorkers) {
 					continue
 				}
-				net := workersBlockedNet.Load()
-				utilization := float64(net) / float64(cur)
+				netBlocked := workersBlockedNet.Load()
+				utilization := float64(netBlocked) / float64(cur)
 				if utilization < scaleUpThreshold {
 					continue
 				}
-				// Measured avg RTT = workers_net / current_tps.
-				// Required workers = targetTPS * avgRTT. Add 20% more.
-				toAdd := int64(float64(cur) * 0.20)
+				// Workers are saturated. Compute needed count directly:
+				// needed = netBlocked / target_utilization (target 65% — 35% headroom
+				// for rate-limiter waits and CPU work between messages).
+				needed := int64(float64(netBlocked) / 0.65)
+				if needed <= cur {
+					// At least 30% more when utilization is high.
+					needed = int64(float64(cur) * 1.3)
+				}
+				if needed > int64(maxWorkers) {
+					needed = int64(maxWorkers)
+				}
+				toAdd := needed - cur
 				if toAdd < 4 {
 					toAdd = 4
-				}
-				if cur+toAdd > maxWorkers {
-					toAdd = maxWorkers - cur
 				}
 				for i := int64(0); i < toAdd; i++ {
 					spawnWorker()
@@ -504,6 +560,7 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 					"added":       toAdd,
 					"total":       cur + toAdd,
 					"utilization": fmt.Sprintf("%.0f%%", utilization*100),
+					"net_blocked": netBlocked,
 				}).Info("Autoscaled worker pool")
 			}
 		}
@@ -522,14 +579,20 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, tps float6
 
 // runDeletionDispatcher manages deferred session deletions using a min-heap.
 // Sessions arrive via pendingCh with a target deleteAt time. The dispatcher
-// wakes up when the earliest session is due, then spawns a short goroutine to
-// send the deletion and release the semaphore. This reduces O(activeSessions)
-// sleeping goroutines to O(1) goroutine + a heap, dramatically cutting scheduler load.
+// wakes up when the earliest session is due, then sends fire-and-forget
+// deletions inline using pre-encoded bytes. No per-deletion goroutines are
+// spawned — the dispatcher does UDP writes directly (non-blocking for UDP).
+//
+// Fire-and-forget: the deletion is tracked for retransmission/stats by the
+// transaction tracker, but the session resources and semaphore are released
+// immediately after sending. This eliminates ~100ms of goroutine blocking
+// per deletion (RTT wait) and the associated scheduler pressure at scale.
 func (m *Manager) runDeletionDispatcher(
 	ctx context.Context,
 	pendingCh <-chan pendingSession,
 	sem chan struct{},
 	rateLimiter *RateLimiter,
+	preEncodedDel *pfcp.PreEncodedMsg,
 	failedSessions *atomic.Uint64,
 	pendingDelSize *atomic.Int64,
 ) {
@@ -541,6 +604,10 @@ func (m *Manager) runDeletionDispatcher(
 		<-timer.C
 	}
 	var timerArmed bool
+
+	// Pre-allocate a reusable buffer for deletion messages.
+	// Deletion requests are fixed-size (header only, ~16 bytes).
+	delBuf := make([]byte, len(preEncodedDel.Data))
 
 	armTimer := func(d time.Duration) {
 		if timerArmed {
@@ -556,6 +623,34 @@ func (m *Manager) runDeletionDispatcher(
 		}
 		timer.Reset(d)
 		timerArmed = true
+	}
+
+	// sendDeletion sends a pre-encoded deletion using the provided buffer.
+	// Releases session resources and semaphore immediately (fire-and-forget).
+	sendDeletion := func(s *types.SessionInfo, buf []byte) {
+		seqNum := m.seqCounter.Next()
+		preEncodedDel.ApplyInto(buf, seqNum, s.RemoteSEID, 0, nil)
+
+		// Copy for tracker storage (tracker retains data for retransmission).
+		data := make([]byte, len(buf))
+		copy(data, buf)
+
+		m.stats.RecordSent("SessionDeletionRequest")
+		portIdx := m.pool.NextPortIndex()
+
+		// Track for retransmission. ResultCh is buffered(1) so Resolve
+		// won't block even though we never read from it.
+		m.tracker.Track(seqNum, data, portIdx)
+
+		if err := m.pool.SendOn(portIdx, data); err != nil {
+			failedSessions.Add(1)
+		} else {
+			m.stats.RecordSessionDeleted()
+		}
+
+		// Release session resources and semaphore immediately — don't wait for RTT.
+		m.releaseSessionStress(s)
+		<-sem
 	}
 
 	for {
@@ -583,19 +678,24 @@ func (m *Manager) runDeletionDispatcher(
 			for h.Len() > 0 && !(*h)[0].deleteAt.After(now) {
 				pd := heap.Pop(h).(pendingSession)
 				pendingDelSize.Add(-1)
-				// Short-lived deletion goroutine: does real network I/O then releases semaphore.
-				// At 10K TPS with ~1ms RTT there are only ~10 of these in flight at steady state.
-				go func(s *types.SessionInfo) {
-					defer func() { <-sem }()
-					if err := rateLimiter.Wait(ctx); err != nil {
-						m.releaseSession(s)
-						return
-					}
-					if err := m.sendSessionDeletion(ctx, s); err != nil && ctx.Err() == nil {
-						failedSessions.Add(1)
-						m.releaseSession(s)
-					}
-				}(pd.session)
+
+				// Try rate limiter non-blocking first; fall back to goroutine if no token.
+				if rateLimiter.TryWait() {
+					// Got token — send inline using dispatcher's reusable buffer.
+					sendDeletion(pd.session, delBuf)
+				} else {
+					// No token available — spawn a short goroutine to wait for one.
+					// Uses its own buffer since dispatcher may send inline concurrently.
+					go func(s *types.SessionInfo) {
+						if err := rateLimiter.Wait(ctx); err != nil {
+							m.releaseSessionStress(s)
+							<-sem
+							return
+						}
+						buf := make([]byte, len(preEncodedDel.Data))
+						sendDeletion(s, buf)
+					}(pd.session)
+				}
 			}
 			// Re-arm for next due session, if any.
 			if h.Len() > 0 {
@@ -630,7 +730,10 @@ func (m *Manager) executeStressSession(
 		return err
 	}
 
-	// 2. Send modifications using pre-encoded byte templates (Change 3).
+	// 2. Fire all modifications without waiting (pipelined).
+	// Each mod is sent as soon as a rate-limiter token is available; responses are
+	// collected afterward. This cuts per-session blocking from N*RTT to ~RTT.
+	modResults := make([]<-chan types.TransactionResult, 0, len(tmpl.ModMsgs))
 	for _, modMsg := range tmpl.ModMsgs {
 		workersBlockedRate.Add(1)
 		err := rateLimiter.Wait(ctx)
@@ -639,13 +742,38 @@ func (m *Manager) executeStressSession(
 			m.cleanupStressSession(ctx, session)
 			return err
 		}
-		if err := m.sendPreEncodedModification(ctx, modMsg, session, workersBlockedNet); err != nil {
+		ch, sendErr := m.firePreEncodedModification(modMsg, session)
+		if sendErr != nil {
 			if ctx.Err() != nil {
 				m.cleanupStressSession(ctx, session)
-				return err
+				return ctx.Err()
 			}
-			log.WithError(err).Debug("Modification failed")
+			log.WithError(sendErr).Debug("Modification send failed")
+			continue
 		}
+		modResults = append(modResults, ch)
+	}
+
+	// Collect all modification responses. The worker is blocked on network
+	// for the duration but all mods are already in-flight simultaneously.
+	if len(modResults) > 0 {
+		workersBlockedNet.Add(1)
+		for _, ch := range modResults {
+			result := m.waitForResult(ctx, ch)
+			if result.Error != nil {
+				if ctx.Err() != nil {
+					workersBlockedNet.Add(-1)
+					m.cleanupStressSession(ctx, session)
+					return ctx.Err()
+				}
+				m.stats.RecordTimeout("SessionModificationRequest")
+			} else {
+				m.stats.RecordReceived("SessionModificationResponse")
+				m.stats.RecordSuccess("SessionModificationRequest", result.ResponseTime)
+				m.stats.RecordSessionModified()
+			}
+		}
+		workersBlockedNet.Add(-1)
 	}
 
 	// 3. Push to deletion dispatcher with jittered delay.
@@ -688,9 +816,9 @@ func (m *Manager) establishFromPreEncoded(ctx context.Context, pre *pfcp.PreEnco
 		CreatedAt: time.Now(),
 	}
 
-	m.mu.Lock()
-	m.byLocalSEID[localSEID] = session
-	m.mu.Unlock()
+	// Stress mode: sessions are passed directly between goroutines (worker →
+	// deletion dispatcher) — no global map lookups occur. Skip map registration
+	// to eliminate mutex contention (~50K acquisitions/sec at 300K active sessions).
 
 	seqNum := m.seqCounter.Next()
 
@@ -713,48 +841,28 @@ func (m *Manager) establishFromPreEncoded(ctx context.Context, pre *pfcp.PreEnco
 	if result.Error != nil {
 		m.stats.RecordTimeout(msgTypeName)
 		m.stats.RecordSessionFailed()
-		session.State = "failed"
 		return nil, fmt.Errorf("Session Establishment timeout: %w", result.Error)
 	}
 
 	m.stats.RecordReceived("SessionEstablishmentResponse")
 
-	// Parse response to extract the UPF-assigned remote SEID.
-	respMsg, err := pfcp.Decode(result.Response)
+	// Fast-path: extract Cause and remote SEID directly from raw bytes.
+	// Avoids full Decode → message object → ExtractRemoteSEID at 17K+ sessions/sec.
+	remoteSEID, cause, err := pfcp.ExtractEstablishmentResponseFast(result.Response)
 	if err != nil {
 		m.stats.RecordFailure(msgTypeName)
 		m.stats.RecordSessionFailed()
-		return nil, fmt.Errorf("failed to decode Establishment Response: %w", err)
+		return nil, fmt.Errorf("failed to parse Establishment Response: %w", err)
 	}
 
-	resp, ok := respMsg.(*message.SessionEstablishmentResponse)
-	if !ok {
+	if cause != pfcp.CauseRequestAccepted {
 		m.stats.RecordFailure(msgTypeName)
 		m.stats.RecordSessionFailed()
-		return nil, fmt.Errorf("unexpected response type: %T", respMsg)
+		return nil, fmt.Errorf("Session Establishment rejected with cause %d", cause)
 	}
 
-	if resp.Cause != nil {
-		cause, cErr := resp.Cause.Cause()
-		if cErr == nil && cause != ie.CauseRequestAccepted {
-			m.stats.RecordFailure(msgTypeName)
-			m.stats.RecordSessionFailed()
-			session.State = "failed"
-			return nil, fmt.Errorf("Session Establishment rejected with cause %d", cause)
-		}
-	}
-
-	remoteSEID, err := pfcp.ExtractRemoteSEID(resp)
-	if err != nil {
-		m.stats.RecordFailure(msgTypeName)
-		m.stats.RecordSessionFailed()
-		return nil, fmt.Errorf("failed to extract remote SEID: %w", err)
-	}
-
-	m.mu.Lock()
 	session.RemoteSEID = remoteSEID
 	session.State = "established"
-	m.mu.Unlock()
 
 	m.stats.RecordSuccess(msgTypeName, result.ResponseTime)
 	m.stats.RecordSessionEstablished()
@@ -770,35 +878,24 @@ func (m *Manager) establishFromPreEncoded(ctx context.Context, pre *pfcp.PreEnco
 	return session, nil
 }
 
-// sendPreEncodedModification sends a pre-encoded Session Modification Request,
-// patching the header SEID (remoteSEID), UE IP, and seq num by byte-copying the template.
-func (m *Manager) sendPreEncodedModification(ctx context.Context, pre *pfcp.PreEncodedMsg, session *types.SessionInfo, workersBlockedNet *atomic.Int64) error {
+// firePreEncodedModification sends a pre-encoded Session Modification Request
+// and returns the result channel without waiting. Callers collect results later
+// to pipeline multiple modifications within a session.
+func (m *Manager) firePreEncodedModification(pre *pfcp.PreEncodedMsg, session *types.SessionInfo) (<-chan types.TransactionResult, error) {
 	seqNum := m.seqCounter.Next()
 
 	data := make([]byte, len(pre.Data))
 	pre.ApplyInto(data, seqNum, session.RemoteSEID, 0 /* no CP-FSEID in modifications */, session.UEIP)
 
-	msgTypeName := "SessionModificationRequest"
-	m.stats.RecordSent(msgTypeName)
+	m.stats.RecordSent("SessionModificationRequest")
 	portIdx := m.pool.NextPortIndex()
 	resultCh := m.tracker.Track(seqNum, data, portIdx)
 
 	if err := m.pool.SendOn(portIdx, data); err != nil {
-		return fmt.Errorf("failed to send Session Modification: %w", err)
+		return nil, fmt.Errorf("failed to send Session Modification: %w", err)
 	}
 
-	workersBlockedNet.Add(1)
-	result := m.waitForResult(ctx, resultCh)
-	workersBlockedNet.Add(-1)
-	if result.Error != nil {
-		m.stats.RecordTimeout(msgTypeName)
-		return fmt.Errorf("Session Modification timeout: %w", result.Error)
-	}
-
-	m.stats.RecordReceived("SessionModificationResponse")
-	m.stats.RecordSuccess(msgTypeName, result.ResponseTime)
-	m.stats.RecordSessionModified()
-	return nil
+	return resultCh, nil
 }
 
 // establishFromRaw decodes a raw establishment message and establishes the session.
@@ -1317,10 +1414,44 @@ func (m *Manager) sendSessionDeletion(ctx context.Context, session *types.Sessio
 	return nil
 }
 
+// sendSessionDeletionStress is like sendSessionDeletion but uses releaseSessionStress
+// to avoid mutex contention on session maps in the stress hot path.
+func (m *Manager) sendSessionDeletionStress(ctx context.Context, session *types.SessionInfo) error {
+	seqNum := m.seqCounter.Next()
+	req := message.NewSessionDeletionRequest(0, 0, session.RemoteSEID, seqNum, 0)
+
+	data, err := pfcp.Encode(req)
+	if err != nil {
+		return fmt.Errorf("failed to encode auto-deletion: %w", err)
+	}
+
+	msgTypeName := "SessionDeletionRequest"
+	m.stats.RecordSent(msgTypeName)
+	portIdx := m.pool.NextPortIndex()
+	resultCh := m.tracker.Track(seqNum, data, portIdx)
+
+	if err := m.pool.SendOn(portIdx, data); err != nil {
+		return fmt.Errorf("failed to send auto-deletion: %w", err)
+	}
+
+	result := m.waitForResult(ctx, resultCh)
+	if result.Error != nil {
+		m.stats.RecordTimeout(msgTypeName)
+		return fmt.Errorf("auto-deletion timeout: %w", result.Error)
+	}
+
+	m.stats.RecordReceived("SessionDeletionResponse")
+	m.stats.RecordSuccess(msgTypeName, result.ResponseTime)
+	m.stats.RecordSessionDeleted()
+
+	m.releaseSessionStress(session)
+	return nil
+}
+
 // cleanupStressSession releases session resources without sending a deletion
 // to the UPF (used when context is cancelled or errors occur).
 func (m *Manager) cleanupStressSession(ctx context.Context, session *types.SessionInfo) {
-	m.releaseSession(session)
+	m.releaseSessionStress(session)
 }
 
 // releaseSession frees SEID, UE IP and removes session from maps.
@@ -1338,6 +1469,16 @@ func (m *Manager) releaseSession(session *types.SessionInfo) {
 		delete(m.byOriginalRemoteSEID, session.OriginalRemoteSEID)
 	}
 	m.mu.Unlock()
+}
+
+// releaseSessionStress releases SEID and UE IP without touching session maps.
+// In stress mode, sessions are never registered in global maps, so no map
+// cleanup is needed. This eliminates mutex contention on the hot path.
+func (m *Manager) releaseSessionStress(session *types.SessionInfo) {
+	m.seidAlloc.Release(session.LocalSEID)
+	if session.UEIP != nil {
+		m.ipPool.Release(session.UEIP)
+	}
 }
 
 func (m *Manager) handleHeartbeat(ctx context.Context, msg message.Message) error {
@@ -1439,8 +1580,7 @@ func (m *Manager) handleResponses(ctx context.Context) {
 			if !ok {
 				return
 			}
-			seqNum := received.Message.Sequence()
-			m.tracker.Resolve(seqNum, received.Message, received.Data)
+			m.tracker.Resolve(received.SeqNum, received.Data)
 		}
 	}
 }

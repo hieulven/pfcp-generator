@@ -7,7 +7,6 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
-	"github.com/wmnsk/go-pfcp/message"
 
 	"pfcp-generator/pkg/types"
 )
@@ -79,7 +78,7 @@ func (t *TransactionTracker) Track(seqNum uint32, requestData []byte, portIndex 
 }
 
 // Resolve matches a received response to a pending transaction.
-func (t *TransactionTracker) Resolve(seqNum uint32, response message.Message, responseData []byte) {
+func (t *TransactionTracker) Resolve(seqNum uint32, responseData []byte) {
 	s := t.shard(seqNum)
 
 	s.mu.Lock()

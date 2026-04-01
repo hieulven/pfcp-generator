@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -34,14 +35,27 @@ type sessionShard struct {
 	sessions map[uint64]*session // UP SEID → session
 }
 
+// delayedResponse holds a response waiting to be sent after a delay.
+type delayedResponse struct {
+	data   []byte
+	addr   net.UDPAddr
+	sendAt time.Time
+}
+
 type mockUPF struct {
 	addr       string
 	conn       *net.UDPConn
 	localIP    net.IP
 	recoveryTS time.Time
+	delay      time.Duration
+	jitter     time.Duration
 
 	shards     [numShards]sessionShard
 	nextUPSEID atomic.Uint64
+
+	// delayCh carries responses to the delay drainer goroutine.
+	// Eliminates per-response goroutine creation from time.AfterFunc.
+	delayCh chan delayedResponse
 
 	received atomic.Uint64
 	sent     atomic.Uint64
@@ -57,6 +71,7 @@ func newMockUPF(addr string) *mockUPF {
 		addr:       addr,
 		localIP:    net.ParseIP(host),
 		recoveryTS: time.Now(),
+		delayCh:    make(chan delayedResponse, 100000),
 	}
 	u.nextUPSEID.Store(1)
 	for i := range u.shards {
@@ -119,10 +134,16 @@ func (u *mockUPF) run() error {
 
 	log.Printf("Mock UPF listening on %s", u.addr)
 
-	// Use multiple reader goroutines for higher throughput
-	numReaders := 4
+	// Use multiple reader goroutines for higher throughput.
+	numReaders := 8
 	for i := 0; i < numReaders; i++ {
 		go u.readLoop()
+	}
+
+	// Single-goroutine delay drainer using a flat slice + 1ms ticker.
+	// Replaces time.AfterFunc which spawned 40K+ goroutines/sec.
+	if u.delay > 0 {
+		go u.delayDrainerHeap()
 	}
 
 	// Block on signal
@@ -158,12 +179,86 @@ func (u *mockUPF) readLoop() {
 		}
 
 		if resp != nil {
-			if _, err := u.conn.WriteToUDP(resp, remoteAddr); err != nil {
-				u.errors.Add(1)
-				continue
+			if u.delay > 0 {
+				d := u.delay
+				if u.jitter > 0 {
+					d += time.Duration(rand.Int63n(int64(u.jitter)))
+				}
+				u.delayCh <- delayedResponse{
+					data:   resp,
+					addr:   *remoteAddr,
+					sendAt: time.Now().Add(d),
+				}
+			} else {
+				if _, err := u.conn.WriteToUDP(resp, remoteAddr); err != nil {
+					u.errors.Add(1)
+					continue
+				}
+				u.sent.Add(1)
 			}
-			u.sent.Add(1)
 		}
+	}
+}
+
+// delayDrainerHeap uses a min-heap to batch-send responses when they're due.
+// One goroutine replaces 40K+ time.AfterFunc goroutines per second, dramatically
+// reducing scheduler overhead on the same machine as the generator.
+func (u *mockUPF) delayDrainerHeap() {
+	type entry struct {
+		data   []byte
+		addr   net.UDPAddr
+		sendAt time.Time
+	}
+	// Simple ring buffer — at 40K msgs/s with 200ms max delay, ~8K entries in flight.
+	pending := make([]entry, 0, 16384)
+
+	ticker := time.NewTicker(1 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case dr, ok := <-u.delayCh:
+			if !ok {
+				return
+			}
+			pending = append(pending, entry{data: dr.data, addr: dr.addr, sendAt: dr.sendAt})
+			// Drain channel burst without blocking on ticker
+		drain:
+			for {
+				select {
+				case dr, ok := <-u.delayCh:
+					if !ok {
+						return
+					}
+					pending = append(pending, entry{data: dr.data, addr: dr.addr, sendAt: dr.sendAt})
+				default:
+					break drain
+				}
+			}
+
+		case <-ticker.C:
+		}
+
+		if len(pending) == 0 {
+			continue
+		}
+
+		now := time.Now()
+		// Send all due responses. Compact the slice by swapping with the tail.
+		j := 0
+		for i := range pending {
+			if !pending[i].sendAt.After(now) {
+				if _, err := u.conn.WriteToUDP(pending[i].data, &pending[i].addr); err != nil {
+					u.errors.Add(1)
+				} else {
+					u.sent.Add(1)
+				}
+			} else {
+				pending[j] = pending[i]
+				j++
+			}
+		}
+		pending = pending[:j]
 	}
 }
 
@@ -310,9 +405,16 @@ func (u *mockUPF) printStats() {
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8805", "UDP address to listen on")
+	delayMs := flag.Int("delay", 0, "Response delay in milliseconds (simulates network RTT)")
+	jitterMs := flag.Int("jitter", 0, "Random jitter added to delay in milliseconds")
 	flag.Parse()
 
 	upf := newMockUPF(*addr)
+	upf.delay = time.Duration(*delayMs) * time.Millisecond
+	upf.jitter = time.Duration(*jitterMs) * time.Millisecond
+	if upf.delay > 0 {
+		log.Printf("Response delay: %v (jitter: %v)", upf.delay, upf.jitter)
+	}
 
 	// Periodic stats logging
 	go func() {

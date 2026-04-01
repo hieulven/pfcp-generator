@@ -18,11 +18,15 @@ const (
 // IE type constants used for scanning encoded PFCP messages.
 const (
 	ieTypeFSEID       = 57 // F-SEID (CP-FSEID in establishment)
+	ieTypeCause       = 19 // Cause IE
 	ieTypeCreatePDR   = 1
 	ieTypeUpdatePDR   = 9
 	ieTypePDI         = 2
 	ieTypeUEIPAddress = 93
 )
+
+// Cause values.
+const CauseRequestAccepted = 1
 
 // PreEncodedMsg is a PFCP message pre-encoded to bytes with byte offsets for
 // the per-session variable fields. At send time, copy the Data bytes and apply
@@ -176,6 +180,30 @@ func PreEncodeModification(modifier *Modifier, raw []byte) (*PreEncodedMsg, erro
 	}, nil
 }
 
+// PreEncodeDeletion builds a pre-encoded Session Deletion Request template.
+// Deletion requests have no IEs — only the PFCP header with SEID and sequence number.
+// Variable fields per session: header SEID (remoteSEID) and sequence number.
+func PreEncodeDeletion() (*PreEncodedMsg, error) {
+	req := message.NewSessionDeletionRequest(0, 0, 0 /* placeholder SEID */, 0 /* placeholder seq */, 0)
+
+	data, err := Encode(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode: %w", err)
+	}
+
+	if len(data) < pfcpHeaderIEStart {
+		return nil, fmt.Errorf("encoded message too short: %d bytes", len(data))
+	}
+
+	return &PreEncodedMsg{
+		Data:             data,
+		SeqOffset:        pfcpHeaderSeqOffset,
+		HeaderSEIDOffset: pfcpHeaderSEIDOffset,
+		CPFSEIDOffset:    -1, // deletions have no CP-FSEID
+		UEIPv4Offsets:    nil,
+	}, nil
+}
+
 // scanForPatchOffsets scans TLV-encoded PFCP IEs starting at ieStart and returns:
 //   - the byte offset of the 8-byte SEID field within the first F-SEID IE value (-1 if absent)
 //   - the byte offsets of each 4-byte IPv4 field within UE IP Address IEs
@@ -249,4 +277,64 @@ func scanPDI(data []byte, start, end int, ueIPOffsets *[]int) {
 
 		off = valOff + ieLen
 	}
+}
+
+// ExtractEstablishmentResponseFast extracts the Cause and UP F-SEID from a raw
+// Session Establishment Response without allocating message objects. This is the
+// hot-path alternative to Decode + ExtractRemoteSEID at 17K+ sessions/sec.
+//
+// Returns (remoteSEID, cause, error). cause=1 means RequestAccepted.
+func ExtractEstablishmentResponseFast(data []byte) (uint64, uint8, error) {
+	if len(data) < pfcpHeaderIEStart {
+		return 0, 0, fmt.Errorf("response too short: %d bytes", len(data))
+	}
+
+	// Verify S flag is set (bit 0 of first byte)
+	if data[0]&0x01 == 0 {
+		return 0, 0, fmt.Errorf("no SEID in response header")
+	}
+
+	var remoteSEID uint64
+	var cause uint8
+	foundSEID := false
+	foundCause := false
+
+	for off := pfcpHeaderIEStart; off+4 <= len(data); {
+		ieType := int(data[off])<<8 | int(data[off+1])
+		ieLen := int(data[off+2])<<8 | int(data[off+3])
+		valOff := off + 4
+
+		if valOff+ieLen > len(data) {
+			break
+		}
+
+		switch ieType {
+		case ieTypeFSEID:
+			// F-SEID value: [flags(1)] [SEID(8)] [IPv4(4)?] [IPv6(16)?]
+			if ieLen >= 9 {
+				remoteSEID = binary.BigEndian.Uint64(data[valOff+1 : valOff+9])
+				foundSEID = true
+			}
+		case ieTypeCause:
+			if ieLen >= 1 {
+				cause = data[valOff]
+				foundCause = true
+			}
+		}
+
+		if foundSEID && foundCause {
+			break // early exit, no need to scan remaining IEs
+		}
+
+		off = valOff + ieLen
+	}
+
+	if !foundSEID {
+		return 0, 0, fmt.Errorf("no F-SEID IE in establishment response")
+	}
+	if !foundCause {
+		return 0, 0, fmt.Errorf("no Cause IE in establishment response")
+	}
+
+	return remoteSEID, cause, nil
 }
