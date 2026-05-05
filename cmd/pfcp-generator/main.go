@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/viper"
 
 	"pfcp-generator/internal/config"
+	"pfcp-generator/internal/control"
 	"pfcp-generator/internal/network"
 	"pfcp-generator/internal/pcap"
 	"pfcp-generator/internal/session"
@@ -71,6 +72,9 @@ file, modifying session-specific identifiers, and replaying them to a target UPF
 	rootCmd.Flags().Int("duration", 0, "Test duration in seconds (stress mode, 0=unlimited)")
 	rootCmd.Flags().String("log-file", "", "Log file path (auto-set to pfcp-generator.log in stress mode)")
 
+	// Control server
+	rootCmd.Flags().Int("control-port", 0, "TCP port for runtime control (0=disabled, overrides config)")
+
 	// Bind CLI flags to viper
 	v := viper.New()
 	bindFlag(v, rootCmd, "pcap", "input.pcap_file")
@@ -116,7 +120,6 @@ func run(cmd *cobra.Command, args []string) error {
 		if cfgFile != "" {
 			return fmt.Errorf("failed to read config file: %w", err)
 		}
-		// Config file not found is OK if using CLI flags
 		log.Debug("No config file found, using defaults and CLI flags")
 	}
 
@@ -157,7 +160,6 @@ func run(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	} else {
-		// In dry-run mode, skip network-related validation
 		if cfg.Input.PcapFile == "" {
 			return fmt.Errorf("input.pcap_file must be specified")
 		}
@@ -176,7 +178,6 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no PFCP request messages found in pcap file")
 	}
 
-	// Validate pcap has establishment requests
 	if err := parser.ValidateHasEstablishment(messages); err != nil {
 		return err
 	}
@@ -276,15 +277,33 @@ func runStressMode(ctx context.Context, mgr *session.Manager, cfg *config.Config
 	if cfg.Logging.File != "" {
 		fmt.Printf("Logs: %s\n", cfg.Logging.File)
 	}
+
+	// Create runtime-tunable stress params
+	params := control.NewStressParams(float64(cfg.Stress.TPS), cfg.Stress.ActiveSessions)
+
+	// Start control server if configured
+	controlPort := cfg.Stress.ControlPort
+	if controlPort > 0 {
+		controlAddr := fmt.Sprintf(":%d", controlPort)
+		srv := control.NewServer(controlAddr, params)
+		go func() {
+			if err := srv.Start(ctx); err != nil {
+				log.WithError(err).Error("Control server failed")
+			}
+		}()
+		fmt.Printf("Control: pfcp-control %d (or telnet localhost %d)\n", controlPort, controlPort)
+	}
+
 	fmt.Println()
 
 	// Start live dashboard
 	reporter.SetTargetTPS(cfg.Stress.TPS)
+	reporter.SetTargetTPSFunc(func() int { return int(params.GetTPS()) })
 	stopDashboard := reporter.StartLiveDashboard(ctx)
 
 	duration := time.Duration(cfg.Stress.DurationSec) * time.Second
 
-	if err := mgr.ReplayStress(ctx, plan, float64(cfg.Stress.TPS), cfg.Stress.ActiveSessions, duration); err != nil {
+	if err := mgr.ReplayStress(ctx, plan, params, duration); err != nil {
 		if ctx.Err() != nil {
 			log.Info("Stress test interrupted by shutdown")
 		} else {
@@ -349,7 +368,6 @@ func runNormalMode(ctx context.Context, mgr *session.Manager, cfg *config.Config
 			break
 		}
 
-		// Between iterations: clean up active sessions, reset state, then wait
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		mgr.CleanupSessions(cleanupCtx)
 		cleanupCancel()
@@ -364,14 +382,12 @@ func runNormalMode(ctx context.Context, mgr *session.Manager, cfg *config.Config
 		}
 	}
 
-	// Cleanup sessions if configured (after final iteration)
 	if cfg.Session.CleanupOnExit {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		mgr.CleanupSessions(cleanupCtx)
 		cleanupCancel()
 	}
 
-	// Print final statistics
 	if cfg.Stats.Enabled {
 		reporter.PrintFinalReport()
 		if err := reporter.ExportJSON(); err != nil {
@@ -513,5 +529,9 @@ func bindViperFlags(v *viper.Viper, cmd *cobra.Command) {
 	if cmd.Flags().Changed("duration") {
 		val, _ := cmd.Flags().GetInt("duration")
 		v.Set("stress.duration_sec", val)
+	}
+	if cmd.Flags().Changed("control-port") {
+		val, _ := cmd.Flags().GetInt("control-port")
+		v.Set("stress.control_port", val)
 	}
 }

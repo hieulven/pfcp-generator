@@ -1,6 +1,6 @@
 module pfcp-generator
 
-go 1.25.7
+go 1.23.2
 
 require (
 	github.com/google/gopacket v1.1.19

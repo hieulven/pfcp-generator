@@ -94,6 +94,9 @@ func (c *Config) Validate() error {
 		if c.Stress.DurationSec < 0 {
 			errs = append(errs, "stress.duration_sec must be >= 0")
 		}
+		if c.Stress.ControlPort < 0 || c.Stress.ControlPort > 65535 {
+			errs = append(errs, fmt.Sprintf("stress.control_port must be between 0 and 65535, got %d", c.Stress.ControlPort))
+		}
 	}
 
 	if len(errs) > 0 {

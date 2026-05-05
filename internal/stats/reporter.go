@@ -19,6 +19,7 @@ type Reporter struct {
 	intervalSec int
 	exportFile  string
 	targetTPS   int
+	getTargetTPS func() int // live getter, overrides targetTPS if set
 
 	// Live dashboard state (only accessed from dashboard goroutine)
 	prevSent  uint64
@@ -38,6 +39,12 @@ func NewReporter(collector *Collector, intervalSec int, exportFile string) *Repo
 // SetTargetTPS sets the target TPS for dashboard display.
 func (r *Reporter) SetTargetTPS(tps int) {
 	r.targetTPS = tps
+}
+
+// SetTargetTPSFunc sets a live getter for target TPS (for runtime tuning).
+// When set, this overrides the static targetTPS value.
+func (r *Reporter) SetTargetTPSFunc(fn func() int) {
+	r.getTargetTPS = fn
 }
 
 // StartPeriodicReport begins periodic statistics reporting in a goroutine.
@@ -311,9 +318,13 @@ func (r *Reporter) FormatDashboard() string {
 
 	// ─── TPS & Elapsed ───
 	fullSep("├", "─", "┤")
-	if r.targetTPS > 0 {
+	displayTargetTPS := r.targetTPS
+	if r.getTargetTPS != nil {
+		displayTargetTPS = r.getTargetTPS()
+	}
+	if displayTargetTPS > 0 {
 		fullRow(fmt.Sprintf(" Elapsed: %-14s TPS: %s current / %s avg  (target: %s)",
-			fmtDuration(elapsed), fmtNum(uint64(currentTPS)), fmtNum(uint64(avgTPS)), fmtNum(uint64(r.targetTPS))))
+			fmtDuration(elapsed), fmtNum(uint64(currentTPS)), fmtNum(uint64(avgTPS)), fmtNum(uint64(displayTargetTPS))))
 	} else {
 		fullRow(fmt.Sprintf(" Elapsed: %-14s TPS: %s current / %s avg",
 			fmtDuration(elapsed), fmtNum(uint64(currentTPS)), fmtNum(uint64(avgTPS))))

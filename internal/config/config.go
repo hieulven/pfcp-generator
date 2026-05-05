@@ -76,6 +76,7 @@ type StressConfig struct {
 	TPS            int  `yaml:"tps"             mapstructure:"tps"`
 	ActiveSessions int  `yaml:"active_sessions" mapstructure:"active_sessions"`
 	DurationSec    int  `yaml:"duration_sec"    mapstructure:"duration_sec"`
+	ControlPort    int  `yaml:"control_port"    mapstructure:"control_port"`
 }
 
 // AllPools returns the list of UE IP pool CIDRs. If UEIPPools is set, it takes
@@ -114,6 +115,7 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("stress.tps", 50000)
 	v.SetDefault("stress.active_sessions", 10000)
 	v.SetDefault("stress.duration_sec", 0)
+	v.SetDefault("stress.control_port", 0)
 }
 
 // Load reads configuration from a YAML file and returns a Config.
@@ -173,6 +175,9 @@ func (c *Config) Summary() string {
 			sb.WriteString(fmt.Sprintf("  Duration:      %ds\n", c.Stress.DurationSec))
 		} else {
 			sb.WriteString("  Duration:      unlimited (Ctrl+C to stop)\n")
+		}
+		if c.Stress.ControlPort > 0 {
+			sb.WriteString(fmt.Sprintf("  Control:       port %d\n", c.Stress.ControlPort))
 		}
 	} else {
 		sb.WriteString(fmt.Sprintf("  Msg Interval:  %dms\n", c.Timing.MessageIntervalMs))
