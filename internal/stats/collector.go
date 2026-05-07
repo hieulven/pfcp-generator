@@ -8,19 +8,39 @@ import (
 )
 
 // Histogram bucket boundaries in nanoseconds.
+// Fine resolution in the 1-10ms range where most PFCP responses land.
 var histBoundaries = [...]int64{
+	50_000,        // 50µs
 	100_000,       // 100µs
+	150_000,       // 150µs
 	200_000,       // 200µs
+	300_000,       // 300µs
 	500_000,       // 500µs
+	750_000,       // 750µs
 	1_000_000,     // 1ms
+	1_250_000,     // 1.25ms
+	1_500_000,     // 1.5ms
+	1_750_000,     // 1.75ms
 	2_000_000,     // 2ms
+	2_500_000,     // 2.5ms
+	3_000_000,     // 3ms
+	3_500_000,     // 3.5ms
+	4_000_000,     // 4ms
 	5_000_000,     // 5ms
+	6_000_000,     // 6ms
+	7_000_000,     // 7ms
+	8_000_000,     // 8ms
 	10_000_000,    // 10ms
+	15_000_000,    // 15ms
 	20_000_000,    // 20ms
+	30_000_000,    // 30ms
 	50_000_000,    // 50ms
+	75_000_000,    // 75ms
 	100_000_000,   // 100ms
+	200_000_000,   // 200ms
 	500_000_000,   // 500ms
 	1_000_000_000, // 1s
+	2_000_000_000, // 2s
 	5_000_000_000, // 5s
 }
 
@@ -101,21 +121,39 @@ func (h *ResponseTimeHistogram) Count() uint64 {
 	return h.count.Load()
 }
 
+// percentile uses linear interpolation within the bucket that contains the
+// target rank, producing smooth values instead of snapping to bucket boundaries.
 func (h *ResponseTimeHistogram) percentile(total uint64, pct float64) time.Duration {
-	target := uint64(float64(total)*pct + 0.5)
-	if target == 0 {
+	target := float64(total) * pct
+	if target < 1 {
 		target = 1
 	}
+
 	var cumulative uint64
 	for i := 0; i < numBuckets; i++ {
-		cumulative += h.buckets[i].Load()
-		if cumulative >= target {
-			// Return the upper bound of this bucket as the percentile estimate
-			if i < len(histBoundaries) {
-				return time.Duration(histBoundaries[i])
+		bucketCount := h.buckets[i].Load()
+		prevCumulative := cumulative
+		cumulative += bucketCount
+		if float64(cumulative) >= target && bucketCount > 0 {
+			// Target rank falls within bucket i.
+			// Bucket i covers the range (lowerBound, upperBound].
+			var lowerBound, upperBound int64
+			if i == 0 {
+				lowerBound = 0
+			} else {
+				lowerBound = histBoundaries[i-1]
 			}
-			// Last bucket: return max
-			return time.Duration(h.max.Load())
+			if i < len(histBoundaries) {
+				upperBound = histBoundaries[i]
+			} else {
+				return time.Duration(h.max.Load())
+			}
+
+			// Interpolate: position within this bucket (0.0 = bottom, 1.0 = top)
+			rankInBucket := target - float64(prevCumulative)
+			fraction := rankInBucket / float64(bucketCount)
+			interpolated := float64(lowerBound) + fraction*float64(upperBound-lowerBound)
+			return time.Duration(int64(interpolated))
 		}
 	}
 	return time.Duration(h.max.Load())

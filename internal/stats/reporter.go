@@ -2,11 +2,13 @@ package stats
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -20,6 +22,13 @@ type Reporter struct {
 	exportFile  string
 	targetTPS   int
 	getTargetTPS func() int // live getter, overrides targetTPS if set
+
+	// CSV time-series export
+	csvFile    string
+	csvWriter  *csv.Writer
+	csvFd      *os.File
+	csvMu      sync.Mutex
+	csvStarted bool
 
 	// Live dashboard state (only accessed from dashboard goroutine)
 	prevSent  uint64
@@ -45,6 +54,12 @@ func (r *Reporter) SetTargetTPS(tps int) {
 // When set, this overrides the static targetTPS value.
 func (r *Reporter) SetTargetTPSFunc(fn func() int) {
 	r.getTargetTPS = fn
+}
+
+// SetCSVFile sets the path for CSV time-series export.
+// Call before StartLiveDashboard.
+func (r *Reporter) SetCSVFile(path string) {
+	r.csvFile = path
 }
 
 // StartPeriodicReport begins periodic statistics reporting in a goroutine.
@@ -179,11 +194,126 @@ func (r *Reporter) FormatReport() string {
 	return sb.String()
 }
 
+// ─── CSV Time-Series Export ──────────────────────────────────────────
+
+func (r *Reporter) initCSV() error {
+	if r.csvFile == "" {
+		return nil
+	}
+	r.csvMu.Lock()
+	defer r.csvMu.Unlock()
+	if r.csvStarted {
+		return nil
+	}
+	fd, err := os.Create(r.csvFile)
+	if err != nil {
+		return fmt.Errorf("failed to create CSV file %s: %w", r.csvFile, err)
+	}
+	r.csvFd = fd
+	r.csvWriter = csv.NewWriter(fd)
+	header := []string{
+		"timestamp", "elapsed_sec", "current_tps", "avg_tps", "target_tps",
+		"active_sessions", "sessions_established", "sessions_deleted", "sessions_failed",
+		"total_sent", "total_recv",
+		"resp_min_us", "resp_avg_us", "resp_p50_us", "resp_p95_us", "resp_p99_us", "resp_max_us",
+		"est_req_sent", "est_req_success", "est_req_timeout",
+		"mod_req_sent", "mod_req_success", "mod_req_timeout",
+		"del_req_sent", "del_req_success", "del_req_timeout",
+	}
+	if err := r.csvWriter.Write(header); err != nil {
+		fd.Close()
+		return fmt.Errorf("failed to write CSV header: %w", err)
+	}
+	r.csvWriter.Flush()
+	r.csvStarted = true
+	log.WithField("file", r.csvFile).Info("CSV time-series export started")
+	return nil
+}
+
+func (r *Reporter) writeCSVRow(snap *CollectorSnapshot, currentTPS, avgTPS float64) {
+	r.csvMu.Lock()
+	defer r.csvMu.Unlock()
+	if r.csvWriter == nil {
+		return
+	}
+	elapsed := snap.Duration()
+	var totalRecv uint64
+	for _, ms := range snap.MessageStats {
+		totalRecv += ms.Received
+	}
+	getMsgStat := func(name string) MessageTypeStatsSnapshot {
+		if s, ok := snap.MessageStats[name]; ok {
+			return s
+		}
+		return MessageTypeStatsSnapshot{}
+	}
+	est := getMsgStat("SessionEstablishmentRequest")
+	mod := getMsgStat("SessionModificationRequest")
+	del := getMsgStat("SessionDeletionRequest")
+	active := snap.ActiveSessions
+	if active < 0 {
+		active = 0
+	}
+	displayTargetTPS := r.targetTPS
+	if r.getTargetTPS != nil {
+		displayTargetTPS = r.getTargetTPS()
+	}
+	row := []string{
+		time.Now().Format("2006-01-02T15:04:05.000"),
+		fmt.Sprintf("%.1f", elapsed.Seconds()),
+		fmt.Sprintf("%.0f", currentTPS),
+		fmt.Sprintf("%.0f", avgTPS),
+		fmt.Sprintf("%d", displayTargetTPS),
+		fmt.Sprintf("%d", active),
+		fmt.Sprintf("%d", snap.SessionsEstablished),
+		fmt.Sprintf("%d", snap.SessionsDeleted),
+		fmt.Sprintf("%d", snap.SessionsFailed),
+		fmt.Sprintf("%d", snap.TotalSent()),
+		fmt.Sprintf("%d", totalRecv),
+		fmt.Sprintf("%d", snap.RespMin.Microseconds()),
+		fmt.Sprintf("%d", snap.RespAvg.Microseconds()),
+		fmt.Sprintf("%d", snap.RespP50.Microseconds()),
+		fmt.Sprintf("%d", snap.RespP95.Microseconds()),
+		fmt.Sprintf("%d", snap.RespP99.Microseconds()),
+		fmt.Sprintf("%d", snap.RespMax.Microseconds()),
+		fmt.Sprintf("%d", est.Sent), fmt.Sprintf("%d", est.Success), fmt.Sprintf("%d", est.Timeout),
+		fmt.Sprintf("%d", mod.Sent), fmt.Sprintf("%d", mod.Success), fmt.Sprintf("%d", mod.Timeout),
+		fmt.Sprintf("%d", del.Sent), fmt.Sprintf("%d", del.Success), fmt.Sprintf("%d", del.Timeout),
+	}
+	if err := r.csvWriter.Write(row); err != nil {
+		log.WithError(err).Warn("Failed to write CSV row")
+		return
+	}
+	r.csvWriter.Flush()
+}
+
+// CloseCSV flushes and closes the CSV file.
+func (r *Reporter) CloseCSV() {
+	r.csvMu.Lock()
+	defer r.csvMu.Unlock()
+	if r.csvWriter != nil {
+		r.csvWriter.Flush()
+	}
+	if r.csvFd != nil {
+		r.csvFd.Close()
+		log.WithField("file", r.csvFile).Info("CSV time-series export closed")
+	}
+	r.csvWriter = nil
+	r.csvFd = nil
+}
+
 // ─── Live Dashboard ──────────────────────────────────────────────────
 
 // StartLiveDashboard starts a 1-second live dashboard on the terminal.
+// Also starts CSV time-series writer if SetCSVFile was called.
 // Returns a stop function that blocks until the goroutine exits.
 func (r *Reporter) StartLiveDashboard(ctx context.Context) (stop func()) {
+	if r.csvFile != "" {
+		if err := r.initCSV(); err != nil {
+			log.WithError(err).Warn("Failed to initialize CSV export")
+		}
+	}
+
 	done := make(chan struct{})
 	stopped := make(chan struct{})
 
@@ -211,6 +341,7 @@ func (r *Reporter) StartLiveDashboard(ctx context.Context) (stop func()) {
 			close(done)
 		}
 		<-stopped
+		r.CloseCSV()
 	}
 }
 
@@ -257,6 +388,11 @@ func (r *Reporter) FormatDashboard() string {
 	}
 	r.prevSent = totalSent
 	r.prevTime = now
+
+	// Write CSV row if enabled
+	if r.csvStarted {
+		r.writeCSVRow(snap, currentTPS, avgTPS)
+	}
 
 	// Table dimensions: total width = 80
 	// Full-width inner = 78, table cols sum = 73 (78 - 5 inner borders)
@@ -380,6 +516,10 @@ func (r *Reporter) FormatDashboard() string {
 	}
 
 	tblSep("└", "┴", "┘")
+
+	if r.csvStarted {
+		sb.WriteString(fmt.Sprintf("  CSV: %s\n", r.csvFile))
+	}
 
 	return sb.String()
 }
