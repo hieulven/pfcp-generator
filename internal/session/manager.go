@@ -284,6 +284,13 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 		"msgs_per_lifecycle": fmt.Sprintf("%.1f", avgMsgsPerLifecycle),
 	}).Info("Computed steady-state parameters")
 
+	// Create the lifetime sampler before any goroutine is spawned.
+	// Worker goroutines in executeStressSession read m.lifetimeSampler;
+	// assigning it here (sequenced-before the goroutine launches) avoids
+	// a data race with the PI controller goroutine.
+	sampler := NewLifetimeSampler(5 * time.Second)
+	m.lifetimeSampler = sampler
+
 	// Atomic snapshot for the PI state — read by reporter, written by the PI goroutine.
 	// Using atomic uint64 to store float64 bits; no mutex needed for display-only reads.
 	var piDelayNs atomic.Int64
@@ -310,9 +317,8 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 	// Adjusts pre-deletion delay to drive observed sessions toward target.
 	// Open-loop on TPS — the rate limiter caps throughput.
 	go func() {
-		sampler := NewLifetimeSampler(5 * time.Second)
-		m.lifetimeSampler = sampler
-
+		// sampler is created in ReplayStress setup (above) so worker goroutines
+		// can safely read m.lifetimeSampler without a data race.
 		pi := NewPIController(0, 60*time.Second)
 
 		ticker := time.NewTicker(1 * time.Second)
@@ -372,7 +378,7 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 				}
 
 				// Update output ceiling based on current base_lifetime
-				pi.outputMax = 100 * baseLifetime
+				pi.SetOutputMax(100 * baseLifetime)
 
 				// Plant gain: ∂sessions/∂delay = observedTPS / msgsPerLifecycle
 				plantGain := observedTPS / avgMsgsPerLifecycle

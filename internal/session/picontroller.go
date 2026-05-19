@@ -84,6 +84,12 @@ func (c *PIController) IsSaturated() bool {
 	return c.output >= c.outputMax || c.output <= c.outputMin
 }
 
+// SetOutputMax updates the saturation ceiling. Safe to call from the same
+// goroutine that calls Update — not safe across goroutines.
+func (c *PIController) SetOutputMax(max time.Duration) {
+	c.outputMax = max
+}
+
 // Reset clears integral and output state. Use on configuration change.
 func (c *PIController) Reset() {
 	c.integral = 0
