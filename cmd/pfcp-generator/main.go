@@ -72,7 +72,6 @@ file, modifying session-specific identifiers, and replaying them to a target UPF
 	rootCmd.Flags().Int("duration", 0, "Test duration in seconds (stress mode, 0=unlimited)")
 	rootCmd.Flags().String("log-file", "", "Log file path (auto-set to pfcp-generator.log in stress mode)")
 	rootCmd.Flags().String("csv-file", "", "CSV file for time-series dashboard export (stress mode)")
-	rootCmd.Flags().Int("ramp-up", 0, "Ramp-up duration in seconds: suppress deletions to accumulate sessions faster (0=use computed steady-state delay)")
 
 	// Control server
 	rootCmd.Flags().Int("control-port", 0, "TCP port for runtime control (0=disabled, overrides config)")
@@ -309,7 +308,7 @@ func runStressMode(ctx context.Context, mgr *session.Manager, cfg *config.Config
 
 	duration := time.Duration(cfg.Stress.DurationSec) * time.Second
 
-	if err := mgr.ReplayStress(ctx, plan, params, duration); err != nil {
+	if err := mgr.ReplayStress(ctx, plan, params, duration, reporter); err != nil {
 		if ctx.Err() != nil {
 			log.Info("Stress test interrupted by shutdown")
 		} else {
@@ -539,9 +538,5 @@ func bindViperFlags(v *viper.Viper, cmd *cobra.Command) {
 	if cmd.Flags().Changed("control-port") {
 		val, _ := cmd.Flags().GetInt("control-port")
 		v.Set("stress.control_port", val)
-	}
-	if cmd.Flags().Changed("ramp-up") {
-		val, _ := cmd.Flags().GetInt("ramp-up")
-		v.Set("stress.ramp_up_sec", val)
 	}
 }

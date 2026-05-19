@@ -15,13 +15,22 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// ControlState holds a snapshot of the PI controller state for display.
+type ControlState struct {
+	Delay     time.Duration
+	Tau       float64
+	Integral  float64
+	Saturated bool
+}
+
 // Reporter outputs statistics to console and/or file.
 type Reporter struct {
-	collector   *Collector
-	intervalSec int
-	exportFile  string
-	targetTPS   int
+	collector    *Collector
+	intervalSec  int
+	exportFile   string
+	targetTPS    int
 	getTargetTPS func() int // live getter, overrides targetTPS if set
+	controlState func() ControlState
 
 	// CSV time-series export
 	csvFile    string
@@ -54,6 +63,12 @@ func (r *Reporter) SetTargetTPS(tps int) {
 // When set, this overrides the static targetTPS value.
 func (r *Reporter) SetTargetTPSFunc(fn func() int) {
 	r.getTargetTPS = fn
+}
+
+// SetControlStateFunc registers a function that returns current PI controller state.
+// Called each dashboard tick and CSV row write.
+func (r *Reporter) SetControlStateFunc(fn func() ControlState) {
+	r.controlState = fn
 }
 
 // SetCSVFile sets the path for CSV time-series export.
@@ -219,6 +234,7 @@ func (r *Reporter) initCSV() error {
 		"est_req_sent", "est_req_success", "est_req_timeout",
 		"mod_req_sent", "mod_req_success", "mod_req_timeout",
 		"del_req_sent", "del_req_success", "del_req_timeout",
+		"delay_ms", "pi_integral", "pi_saturated",
 	}
 	if err := r.csvWriter.Write(header); err != nil {
 		fd.Close()
@@ -258,6 +274,17 @@ func (r *Reporter) writeCSVRow(snap *CollectorSnapshot, currentTPS, avgTPS float
 	if r.getTargetTPS != nil {
 		displayTargetTPS = r.getTargetTPS()
 	}
+	var piDelayMs int64
+	var piIntegral float64
+	piSat := "false"
+	if r.controlState != nil {
+		cs := r.controlState()
+		piDelayMs = cs.Delay.Milliseconds()
+		piIntegral = cs.Integral
+		if cs.Saturated {
+			piSat = "true"
+		}
+	}
 	row := []string{
 		time.Now().Format("2006-01-02T15:04:05.000"),
 		fmt.Sprintf("%.1f", elapsed.Seconds()),
@@ -279,6 +306,7 @@ func (r *Reporter) writeCSVRow(snap *CollectorSnapshot, currentTPS, avgTPS float
 		fmt.Sprintf("%d", est.Sent), fmt.Sprintf("%d", est.Success), fmt.Sprintf("%d", est.Timeout),
 		fmt.Sprintf("%d", mod.Sent), fmt.Sprintf("%d", mod.Success), fmt.Sprintf("%d", mod.Timeout),
 		fmt.Sprintf("%d", del.Sent), fmt.Sprintf("%d", del.Success), fmt.Sprintf("%d", del.Timeout),
+		fmt.Sprintf("%d", piDelayMs), fmt.Sprintf("%.4f", piIntegral), piSat,
 	}
 	if err := r.csvWriter.Write(row); err != nil {
 		log.WithError(err).Warn("Failed to write CSV row")
@@ -486,6 +514,21 @@ func (r *Reporter) FormatDashboard() string {
 			fmtRespTime(snap.RespP99), fmtRespTime(snap.RespMax)))
 	} else {
 		fullRow(" Response   (no data)")
+	}
+
+	// ─── Control loop state ───
+	fullSep("├", "─", "┤")
+	if r.controlState != nil {
+		cs := r.controlState()
+		sat := ""
+		if cs.Saturated {
+			sat = " [SATURATED]"
+		}
+		fullRow(fmt.Sprintf(" Control    Delay: %-10s τ: %-8s Integral: %-12s%s",
+			fmtRespTime(cs.Delay), fmt.Sprintf("%.1fs", cs.Tau),
+			fmt.Sprintf("%.2f", cs.Integral), sat))
+	} else {
+		fullRow(" Control    (no data)")
 	}
 
 	// ─── Message Type Table ───

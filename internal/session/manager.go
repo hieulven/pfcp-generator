@@ -3,7 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
-	"math/rand"
+	"math"
 	"net"
 	"runtime"
 	"sync"
@@ -49,6 +49,9 @@ type Manager struct {
 
 	// Original SEID mappings from pcap (CP SEID → remote SEID)
 	originalSEIDMappings map[uint64]uint64
+
+	// lifetimeSampler is populated by ReplayStress; read by executeStressSession.
+	lifetimeSampler *LifetimeSampler
 }
 
 // SequenceCounter manages PFCP sequence numbers.
@@ -202,7 +205,7 @@ func (d *adaptiveDelay) Set(v time.Duration) {
 //
 // TPS and active-sessions are read from params at runtime, allowing live tuning
 // via the control server without restarting.
-func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *control.StressParams, duration time.Duration) error {
+func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *control.StressParams, duration time.Duration, reporter *stats.Reporter) error {
 	tps := params.GetTPS()
 	activeSessions := params.GetActiveSessions()
 
@@ -277,77 +280,48 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 	}
 	avgMsgsPerLifecycle := float64(totalMsgsPerLifecycle) / float64(len(preEncoded))
 
-	// requiredDelay = targetActiveSessions * avgMsgsPerLifecycle / observedTPS
-	// At steady state: ActiveSessions = (TPS / avgMsgsPerLifecycle) * Delay
-	computeDelay := func(observedTPS float64, targetSess int) time.Duration {
-		creationRate := observedTPS / avgMsgsPerLifecycle
-		if creationRate <= 0 {
-			return 0
-		}
-		return time.Duration(float64(time.Second) * float64(targetSess) / creationRate)
+	log.WithFields(log.Fields{
+		"msgs_per_lifecycle": fmt.Sprintf("%.1f", avgMsgsPerLifecycle),
+	}).Info("Computed steady-state parameters")
+
+	// Atomic snapshot for the PI state — read by reporter, written by the PI goroutine.
+	// Using atomic uint64 to store float64 bits; no mutex needed for display-only reads.
+	var piDelayNs atomic.Int64
+	var piIntegralBits atomic.Uint64
+	var piSaturatedFlag atomic.Bool
+	var piTauBits atomic.Uint64
+
+	// Wire PI state into the reporter dashboard.
+	if reporter != nil {
+		reporter.SetControlStateFunc(func() stats.ControlState {
+			delayNs := piDelayNs.Load()
+			integralBits := piIntegralBits.Load()
+			tauBits := piTauBits.Load()
+			return stats.ControlState{
+				Delay:     time.Duration(delayNs),
+				Tau:       math.Float64frombits(tauBits),
+				Integral:  math.Float64frombits(integralBits),
+				Saturated: piSaturatedFlag.Load(),
+			}
+		})
 	}
 
-	// Initial estimate from target TPS (best guess before we have observed data).
-	initialDelay := computeDelay(tps, activeSessions)
-	naturalRampSec := initialDelay.Seconds()
-
-	// Ramp-up configuration: 0 means use computed delay immediately (natural ramp).
-	// >0 means suppress deletions for that duration to front-load session creation.
-	rampUpSec := m.cfg.Stress.RampUpSec
-
-	log.WithFields(log.Fields{
-		"initial_delay_ms":     initialDelay.Milliseconds(),
-		"natural_ramp_sec":     fmt.Sprintf("%.0f", naturalRampSec),
-		"ramp_up_sec":          rampUpSec,
-		"msgs_per_lifecycle":   fmt.Sprintf("%.1f", avgMsgsPerLifecycle),
-	}).Info("Computed initial steady-state parameters")
-
-	// Set initial delay from target TPS estimate.
-	delay.Set(initialDelay)
-
-	// Calibrator goroutine: recomputes delay from observed TPS every tick.
-	//
-	// The rate limiter controls TPS (caps at target, actual may be lower).
-	// The delay adapts to whatever TPS actually is, targeting the session count.
-	// One knob per target — no conflict.
-	//
-	// With rampUpSec>0: delay starts at 0 (deletions suppressed) for rampUpSec,
-	// then switches to adaptive computation.
+	// PI controller: closed-loop on active session count.
+	// Adjusts pre-deletion delay to drive observed sessions toward target.
+	// Open-loop on TPS — the rate limiter caps throughput.
 	go func() {
-		// Wait for first data before calibrating
-		select {
-		case <-testCtx.Done():
-			return
-		case <-time.After(3 * time.Second):
-		}
+		sampler := NewLifetimeSampler(5 * time.Second)
+		m.lifetimeSampler = sampler
 
-		// If ramp-up requested, suppress deletions initially
-		if rampUpSec > 0 {
-			delay.Set(0)
-			log.WithField("ramp_up_sec", rampUpSec).Info("Ramp-up: suppressing deletions")
-
-			rampTimer := time.NewTimer(time.Duration(rampUpSec) * time.Second)
-			select {
-			case <-testCtx.Done():
-				rampTimer.Stop()
-				return
-			case <-rampTimer.C:
-				// Switch to adaptive — first tick will compute from observed TPS
-				log.WithField("active", m.stats.ActiveSessions.Load()).Info("Ramp-up complete, switching to adaptive delay")
-			}
-		}
+		pi := NewPIController(0, 60*time.Second)
 
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
-		var prevTPS float64
-		var prevActiveSessions int
-		prevTPS = tps
-		prevActiveSessions = activeSessions
+		const dt = 1.0
+		prevTargetTPS := params.GetTPS()
+		prevTargetSess := params.GetActiveSessions()
 
-		// EMA-smoothed observed TPS (α=0.3: responsive but not jumpy)
-		const emaAlpha = 0.3
-		var smoothedTPS float64
 		var prevSent uint64
 		var prevTime time.Time
 
@@ -358,91 +332,94 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 			case <-ticker.C:
 				now := time.Now()
 
-				// Check for runtime parameter changes
-				currentTargetTPS := params.GetTPS()
-				currentTargetSessions := params.GetActiveSessions()
+				curTPS := params.GetTPS()
+				curSess := params.GetActiveSessions()
 
-				if currentTargetTPS != prevTPS {
-					rateLimiter.SetTPS(currentTargetTPS)
+				if curTPS != prevTargetTPS {
+					rateLimiter.SetTPS(curTPS)
 					log.WithFields(log.Fields{
-						"old_tps": fmt.Sprintf("%.0f", prevTPS),
-						"new_tps": fmt.Sprintf("%.0f", currentTargetTPS),
-					}).Info("Target TPS changed at runtime")
-					prevTPS = currentTargetTPS
+						"old": prevTargetTPS, "new": curTPS,
+					}).Info("Target TPS changed")
+					prevTargetTPS = curTPS
 				}
-				if currentTargetSessions != prevActiveSessions {
+				if curSess != prevTargetSess {
 					log.WithFields(log.Fields{
-						"old_sessions": prevActiveSessions,
-						"new_sessions": currentTargetSessions,
-					}).Info("Target active sessions changed at runtime")
-					prevActiveSessions = currentTargetSessions
+						"old": prevTargetSess, "new": curSess,
+					}).Info("Target sessions changed")
+					prevTargetSess = curSess
 				}
 
-				// Measure observed TPS over last tick interval
+				// Measure observed TPS
 				totalSent := m.stats.TotalSent()
-				var instantTPS float64
+				var observedTPS float64
 				if !prevTime.IsZero() {
-					dt := now.Sub(prevTime).Seconds()
-					if dt > 0 {
-						instantTPS = float64(totalSent-prevSent) / dt
+					elapsed := now.Sub(prevTime).Seconds()
+					if elapsed > 0 {
+						observedTPS = float64(totalSent-prevSent) / elapsed
 					}
 				}
 				prevSent = totalSent
 				prevTime = now
 
-				if instantTPS <= 0 {
+				if observedTPS <= 0 {
 					continue
 				}
 
-				// Update EMA
-				if smoothedTPS == 0 {
-					smoothedTPS = instantTPS
-				} else {
-					smoothedTPS = emaAlpha*instantTPS + (1-emaAlpha)*smoothedTPS
+				// Base lifetime: 5s moving average of (establish + mods) duration
+				baseLifetime, sampleCount := sampler.Average()
+				if sampleCount < 5 {
+					continue
 				}
 
-				// Base delay from target TPS — this is the ideal steady state.
-				baseDelay := computeDelay(currentTargetTPS, currentTargetSessions)
+				// Update output ceiling based on current base_lifetime
+				pi.outputMax = 100 * baseLifetime
 
-				// If observed TPS is persistently below target (system can't keep up),
-				// increase delay proportionally so sessions still reach target count.
-				// But only apply this correction when sessions are below target —
-				// if sessions are already at/above target, we must NOT increase delay
-				// further or we create a death spiral (TPS drops → delay up → feeder
-				// blocked → TPS drops more).
-				activeCount := int(m.stats.ActiveSessions.Load())
-				sessionRatio := float64(activeCount) / float64(currentTargetSessions)
-				tpsRatio := smoothedTPS / currentTargetTPS
+				// Plant gain: ∂sessions/∂delay = observedTPS / msgsPerLifecycle
+				plantGain := observedTPS / avgMsgsPerLifecycle
 
-				requiredDelay := baseDelay
-
-				if tpsRatio < 0.90 && sessionRatio < 0.95 {
-					// System can't reach target TPS and sessions still below target:
-					// scale delay up so fewer sessions = target TPS can fill them.
-					// delay = targetSessions * msgsPerLifecycle / observedTPS
-					requiredDelay = computeDelay(smoothedTPS, currentTargetSessions)
-				} else if sessionRatio > 1.10 {
-					// Too many sessions — reduce delay to drain faster
-					requiredDelay = time.Duration(float64(baseDelay) * 0.80)
+				// τ = 2 × (base_lifetime + current_delay); floor at 0.5s
+				currentDelay, _ := pi.State()
+				tau := 2.0 * (baseLifetime.Seconds() + currentDelay.Seconds())
+				if tau < 0.5 {
+					tau = 0.5
 				}
 
-				// Floor: delay must be non-negative
-				if requiredDelay < 0 {
-					requiredDelay = 0
-				}
+				activeSessions := int(m.stats.ActiveSessions.Load())
 
-				delay.Set(requiredDelay)
+				// Backlog saturation: deletion queue has > 10% of target overdue entries
+				// and active sessions are above target — system is throughput-limited.
+				backlogSaturated := pendingDelSize.Load() > int64(curSess)/10 &&
+					activeSessions > int(float64(curSess)*1.05)
+
+				newDelay := pi.Update(
+					float64(activeSessions),
+					float64(curSess),
+					plantGain,
+					tau,
+					dt,
+					backlogSaturated,
+				)
+				delay.Set(newDelay)
+
+				// Write atomic snapshot for reporter
+				_, integral := pi.State()
+				piDelayNs.Store(int64(newDelay))
+				piIntegralBits.Store(math.Float64bits(integral))
+				piSaturatedFlag.Store(pi.IsSaturated())
+				piTauBits.Store(math.Float64bits(tau))
 
 				log.WithFields(log.Fields{
-					"observed_tps": fmt.Sprintf("%.0f", smoothedTPS),
-					"target_tps":   fmt.Sprintf("%.0f", currentTargetTPS),
-					"tps_ratio":    fmt.Sprintf("%.2f", tpsRatio),
-					"target_sess":  currentTargetSessions,
-					"active":       activeCount,
-					"sess_ratio":   fmt.Sprintf("%.2f", sessionRatio),
-					"delay_ms":     requiredDelay.Milliseconds(),
-					"base_ms":      baseDelay.Milliseconds(),
-				}).Debug("Adaptive delay calibration")
+					"observed_tps":     fmt.Sprintf("%.0f", observedTPS),
+					"target_tps":       fmt.Sprintf("%.0f", curTPS),
+					"observed_sess":    activeSessions,
+					"target_sess":      curSess,
+					"base_lifetime_ms": baseLifetime.Milliseconds(),
+					"delay_ms":         newDelay.Milliseconds(),
+					"tau_s":            fmt.Sprintf("%.2f", tau),
+					"integral":         fmt.Sprintf("%.2f", integral),
+					"saturated":        pi.IsSaturated(),
+					"backlog_sat":      backlogSaturated,
+				}).Debug("PI controller tick")
 			}
 		}
 	}()
@@ -636,15 +613,6 @@ func (m *Manager) runDeletionDispatcher(
 	tail := 0
 	count := 0
 
-	// Cap deletions per 5ms tick to avoid flooding the rate limiter.
-	// At most 30% of target TPS goes to deletions. With 5ms tick interval
-	// that's targetTPS * 0.30 / 200 per tick. Floor at 50 to avoid starvation.
-	targetTPS := m.cfg.Stress.TPS
-	maxDrainPerTick := targetTPS * 30 / 100 / 200 // 30% of TPS / 200 ticks per sec
-	if maxDrainPerTick < 50 {
-		maxDrainPerTick = 50
-	}
-
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -693,8 +661,7 @@ func (m *Manager) runDeletionDispatcher(
 
 	drainDue := func() {
 		now := time.Now()
-		drained := 0
-		for count > 0 && drained < maxDrainPerTick {
+		for count > 0 {
 			entry := &ring[head]
 			if entry.deleteAt.After(now) {
 				break
@@ -708,7 +675,6 @@ func (m *Manager) runDeletionDispatcher(
 			}
 
 			pendingDelSize.Add(-1)
-			drained++
 			sendDeletion(entry.session, delBuf)
 
 			head = (head + 1) % len(ring)
@@ -830,12 +796,15 @@ func (m *Manager) executeStressSession(
 		workersBlockedNet.Add(-1)
 	}
 
-	// 3. Push to deletion dispatcher with jittered delay.
-	d := delay.Get()
-	deleteAt := time.Now()
-	if d > 0 {
-		deleteAt = deleteAt.Add(time.Duration(float64(d) * (0.5 + rand.Float64())))
+	// Record base_lifetime (establish + mods, excluding pre-deletion delay)
+	// for the PI controller's gain scheduling.
+	if m.lifetimeSampler != nil {
+		m.lifetimeSampler.Record(time.Since(session.CreatedAt))
 	}
+
+	// 3. Push to deletion dispatcher.
+	d := delay.Get()
+	deleteAt := time.Now().Add(d)
 	select {
 	case pendingCh <- pendingSession{session: session, deleteAt: deleteAt}:
 		return nil
