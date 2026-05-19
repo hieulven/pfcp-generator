@@ -79,9 +79,10 @@ func (c *PIController) State() (output time.Duration, integral float64) {
 	return c.output, c.integral
 }
 
-// IsSaturated returns true if the last output hit either rail.
+// IsSaturated returns true if the last output is pinned at the ceiling.
+// Hitting the floor (zero delay) is a normal resting state and is not reported as saturation.
 func (c *PIController) IsSaturated() bool {
-	return c.output >= c.outputMax || c.output <= c.outputMin
+	return c.output >= c.outputMax
 }
 
 // SetOutputMax updates the saturation ceiling. Safe to call from the same

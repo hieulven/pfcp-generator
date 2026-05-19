@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -30,7 +31,7 @@ type Reporter struct {
 	exportFile   string
 	targetTPS    int
 	getTargetTPS func() int // live getter, overrides targetTPS if set
-	controlState func() ControlState
+	controlState atomic.Pointer[func() ControlState]
 
 	// CSV time-series export
 	csvFile    string
@@ -68,7 +69,7 @@ func (r *Reporter) SetTargetTPSFunc(fn func() int) {
 // SetControlStateFunc registers a function that returns current PI controller state.
 // Called each dashboard tick and CSV row write.
 func (r *Reporter) SetControlStateFunc(fn func() ControlState) {
-	r.controlState = fn
+	r.controlState.Store(&fn)
 }
 
 // SetCSVFile sets the path for CSV time-series export.
@@ -277,8 +278,8 @@ func (r *Reporter) writeCSVRow(snap *CollectorSnapshot, currentTPS, avgTPS float
 	var piDelayMs int64
 	var piIntegral float64
 	piSat := "false"
-	if r.controlState != nil {
-		cs := r.controlState()
+	if fn := r.controlState.Load(); fn != nil {
+		cs := (*fn)()
 		piDelayMs = cs.Delay.Milliseconds()
 		piIntegral = cs.Integral
 		if cs.Saturated {
@@ -518,8 +519,8 @@ func (r *Reporter) FormatDashboard() string {
 
 	// ─── Control loop state ───
 	fullSep("├", "─", "┤")
-	if r.controlState != nil {
-		cs := r.controlState()
+	if fn := r.controlState.Load(); fn != nil {
+		cs := (*fn)()
 		sat := ""
 		if cs.Saturated {
 			sat = " [SATURATED]"
