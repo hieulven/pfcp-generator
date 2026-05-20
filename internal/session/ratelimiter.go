@@ -53,6 +53,7 @@ func NewRateLimiter(ctx context.Context, tps float64) *RateLimiter {
 		defer ticker.Stop()
 
 		lastTick := time.Now()
+		var accum float64 // fractional token carry-over between ticks
 
 		for {
 			select {
@@ -62,11 +63,14 @@ func NewRateLimiter(ctx context.Context, tps float64) *RateLimiter {
 				currentTPS := math.Float64frombits(rl.tpsBits.Load())
 				if currentTPS <= 0 {
 					lastTick = now
+					accum = 0
 					continue
 				}
 				dt := now.Sub(lastTick).Seconds()
 				lastTick = now
-				toEmit := int64(currentTPS * dt)
+				accum += currentTPS * dt
+				toEmit := int64(accum)
+				accum -= float64(toEmit) // keep fractional remainder
 				if toEmit <= 0 {
 					continue
 				}
