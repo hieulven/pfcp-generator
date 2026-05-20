@@ -62,6 +62,17 @@ func (c *PIController) Update(observed, target float64, plantGain, tau, dt float
 		c.integral = proposedIntegral
 	}
 
+	// Clamp integral so ki×integral never exceeds the current output bounds.
+	// This prevents windup when outputMax is raised or lowered mid-run.
+	if ki > 0 {
+		integralCap := float64(c.outputMax) / float64(time.Second) / ki
+		if c.integral > integralCap {
+			c.integral = integralCap
+		} else if c.integral < -integralCap {
+			c.integral = -integralCap
+		}
+	}
+
 	// Recompute with possibly-unchanged integral and clamp
 	out := kp*err + ki*c.integral
 	outDur := time.Duration(out * float64(time.Second))

@@ -250,14 +250,20 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 		"deletion_size": len(preEncodedDel.Data),
 	}).Info("Pre-encoded session templates")
 
-	// Session semaphore
-	sem := make(chan struct{}, activeSessions)
+	// Session semaphore: allocate a large fixed buffer so the capacity can be
+	// increased at runtime without rebuilding the channel. The effective cap is
+	// enforced by semCap (checked by the feeder goroutine), not by channel size.
+	const maxSessions = 2_000_000
+	sem := make(chan struct{}, maxSessions)
+	var semCap atomic.Int64
+	semCap.Store(int64(activeSessions))
 
 	// pendingCh carries sessions waiting for the adaptive delay before deletion.
-	pendingCh := make(chan pendingSession, activeSessions)
+	// Buffer matches maxSessions because the feeder won't exceed semCap in practice.
+	pendingCh := make(chan pendingSession, maxSessions)
 
 	// Work channel
-	workCh := make(chan int, activeSessions)
+	workCh := make(chan int, maxSessions)
 
 	// Adaptive delay
 	delay := &adaptiveDelay{}
@@ -352,6 +358,7 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 					log.WithFields(log.Fields{
 						"old": prevTargetSess, "new": curSess,
 					}).Info("Target sessions changed")
+					semCap.Store(int64(curSess))
 					prevTargetSess = curSess
 				}
 
@@ -377,11 +384,18 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 					continue
 				}
 
-				// Update output ceiling based on current base_lifetime
-				pi.SetOutputMax(100 * baseLifetime)
-
 				// Plant gain: ∂sessions/∂delay = observedTPS / msgsPerLifecycle
 				plantGain := observedTPS / avgMsgsPerLifecycle
+
+				// Ceiling = 10 × theoretical required delay.
+				// theoretical = targetSessions / plantGain (in seconds → Duration).
+				// Floor at 60s so we never clip when base_lifetime is tiny.
+				theoreticalDelay := time.Duration(float64(curSess) / plantGain * float64(time.Second))
+				maxDelay := 10 * theoreticalDelay
+				if maxDelay < 60*time.Second {
+					maxDelay = 60 * time.Second
+				}
+				pi.SetOutputMax(maxDelay)
 
 				// τ = 2 × (base_lifetime + current_delay); floor at 0.5s
 				currentDelay, _ := pi.State()
@@ -470,7 +484,8 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 
 	// Feeder goroutine: pushes session templates to workers as sem slots become available.
 	// Session count is controlled by the delay (how long sessions live before deletion),
-	// not by the feeder. The semaphore caps in-flight sessions at activeSessions.
+	// not by the feeder. The effective semaphore cap is semCap (updated at runtime by
+	// the PI goroutine), not the channel buffer size.
 	go func() {
 		defer close(workCh)
 		templateCount := len(preEncoded)
@@ -479,6 +494,18 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 			select {
 			case <-testCtx.Done():
 				return
+			default:
+			}
+			// Block until we are below the current cap
+			if int64(len(sem)) >= semCap.Load() {
+				select {
+				case <-testCtx.Done():
+					return
+				case <-time.After(1 * time.Millisecond):
+				}
+				continue
+			}
+			select {
 			case sem <- struct{}{}:
 				select {
 				case workCh <- idx % templateCount:
@@ -487,6 +514,8 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 					<-sem
 					return
 				}
+			case <-testCtx.Done():
+				return
 			}
 		}
 	}()

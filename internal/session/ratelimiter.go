@@ -14,6 +14,7 @@ import (
 type RateLimiter struct {
 	tokenCh  chan struct{}
 	tpsBits  atomic.Uint64 // float64 bits stored as uint64
+	epoch    atomic.Uint64 // incremented by SetTPS to signal accounting reset
 	cancel   context.CancelFunc
 	Dropped  atomic.Int64 // tokens dropped due to full buffer (back-pressure)
 }
@@ -53,6 +54,7 @@ func NewRateLimiter(ctx context.Context, tps float64) *RateLimiter {
 
 		var produced int64
 		start := time.Now()
+		lastEpoch := rl.epoch.Load()
 
 		for {
 			select {
@@ -63,6 +65,15 @@ func NewRateLimiter(ctx context.Context, tps float64) *RateLimiter {
 				currentTPS := math.Float64frombits(rl.tpsBits.Load())
 				if currentTPS <= 0 {
 					continue
+				}
+
+				// Detect TPS change: reset wall-clock accounting so we don't
+				// produce a burst to catch up to the old baseline, or stall
+				// because produced already exceeds what the new rate expects.
+				if curEpoch := rl.epoch.Load(); curEpoch != lastEpoch {
+					lastEpoch = curEpoch
+					produced = 0
+					start = time.Now()
 				}
 
 				now := time.Now()
@@ -87,12 +98,14 @@ func NewRateLimiter(ctx context.Context, tps float64) *RateLimiter {
 }
 
 // SetTPS changes the target TPS at runtime. Takes effect on the next tick (~1ms).
-// The producer goroutine reads this atomically — no rebuild or restart needed.
+// The producer goroutine detects the epoch change and resets its wall-clock
+// accounting to avoid stale deficits that would cause a burst or a stall.
 func (r *RateLimiter) SetTPS(tps float64) {
 	if tps <= 0 {
 		tps = 0
 	}
 	r.tpsBits.Store(math.Float64bits(tps))
+	r.epoch.Add(1) // signal producer to reset accounting
 }
 
 // GetTPS returns the current target TPS.
