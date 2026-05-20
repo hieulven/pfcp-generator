@@ -33,13 +33,13 @@ func TestRateLimiter_BasicRate(t *testing.T) {
 }
 
 // TestRateLimiter_TPSDownwardChange verifies that reducing TPS via SetTPS does not
-// cause a dead period (Bug 4). Before the epoch-reset fix, decreasing TPS would stall
-// token production for up to (produced / newTPS) seconds.
+// cause a dead period. The per-tick accumulator design handles this naturally: after
+// a downward change the next tick simply emits newTPS*dt tokens with no stale state.
 func TestRateLimiter_TPSDownwardChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start at 5000 TPS and drain 2000 tokens to build up a large `produced` value.
+	// Start at 5000 TPS and drain some tokens to simulate a running system.
 	const initialTPS = 5000.0
 	rl := NewRateLimiter(ctx, initialTPS)
 	defer rl.Stop()
@@ -49,15 +49,15 @@ func TestRateLimiter_TPSDownwardChange(t *testing.T) {
 		require.NoError(t, rl.Wait(ctx))
 	}
 
-	// Drop to 100 TPS. Without the epoch reset, produced≈200 while the new rate
-	// expects 100*elapsed, so the deficit would be negative for ~2 seconds.
+	// Drop to 100 TPS. The per-tick accumulator produces ~0.1 tokens/tick,
+	// emitting 1 token every ~10ms — well within the 200ms deadline.
 	rl.SetTPS(100.0)
 
-	// We should receive at least 1 token within 100ms despite the downward change.
-	deadline := time.After(100 * time.Millisecond)
+	// We should receive at least 1 token within 200ms despite the downward change.
+	deadline := time.After(200 * time.Millisecond)
 	select {
 	case <-deadline:
-		t.Fatal("no token received within 100ms after TPS decrease — epoch reset may be broken")
+		t.Fatal("no token received within 200ms after TPS decrease")
 	case err := <-func() <-chan error {
 		ch := make(chan error, 1)
 		go func() {

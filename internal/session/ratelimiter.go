@@ -10,13 +10,14 @@ import (
 // RateLimiter controls the rate of operations using a time-aware batch-ticker.
 //
 // Supports live TPS changes via SetTPS() without rebuilding the limiter.
-// The producer goroutine reads the target TPS atomically each tick.
+// The producer goroutine reads the target TPS atomically each tick and emits
+// tokens based only on the elapsed time since the last tick (per-tick deficit),
+// so TPS changes take effect immediately without accumulated state or resets.
 type RateLimiter struct {
-	tokenCh  chan struct{}
-	tpsBits  atomic.Uint64 // float64 bits stored as uint64
-	epoch    atomic.Uint64 // incremented by SetTPS to signal accounting reset
-	cancel   context.CancelFunc
-	Dropped  atomic.Int64 // tokens dropped due to full buffer (back-pressure)
+	tokenCh chan struct{}
+	tpsBits atomic.Uint64 // float64 bits stored as uint64
+	cancel  context.CancelFunc
+	Dropped atomic.Int64 // tokens dropped due to full buffer (back-pressure)
 }
 
 // NewRateLimiter creates a rate limiter that produces tokens at the given TPS rate.
@@ -47,48 +48,38 @@ func NewRateLimiter(ctx context.Context, tps float64) *RateLimiter {
 	rl.tpsBits.Store(math.Float64bits(tps))
 
 	go func() {
-		// Tick at ~1ms for scheduler reliability.
 		interval := time.Millisecond
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		var produced int64
-		start := time.Now()
-		lastEpoch := rl.epoch.Load()
+		lastTick := time.Now()
+		var accum float64 // fractional token carry-over between ticks
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				// Read current TPS atomically — picks up SetTPS() changes.
+			case now := <-ticker.C:
 				currentTPS := math.Float64frombits(rl.tpsBits.Load())
 				if currentTPS <= 0 {
+					lastTick = now
+					accum = 0
 					continue
 				}
-
-				// Detect TPS change: reset wall-clock accounting so we don't
-				// produce a burst to catch up to the old baseline, or stall
-				// because produced already exceeds what the new rate expects.
-				if curEpoch := rl.epoch.Load(); curEpoch != lastEpoch {
-					lastEpoch = curEpoch
-					produced = 0
-					start = time.Now()
-				}
-
-				now := time.Now()
-				expected := int64(currentTPS * now.Sub(start).Seconds())
-				deficit := expected - produced
-				if deficit <= 0 {
+				dt := now.Sub(lastTick).Seconds()
+				lastTick = now
+				accum += currentTPS * dt
+				toEmit := int64(accum)
+				accum -= float64(toEmit) // keep the fractional remainder
+				if toEmit <= 0 {
 					continue
 				}
-				for i := int64(0); i < deficit; i++ {
+				for i := int64(0); i < toEmit; i++ {
 					select {
 					case tokenCh <- struct{}{}:
 					default:
 						rl.Dropped.Add(1)
 					}
-					produced++
 				}
 			}
 		}
@@ -98,14 +89,13 @@ func NewRateLimiter(ctx context.Context, tps float64) *RateLimiter {
 }
 
 // SetTPS changes the target TPS at runtime. Takes effect on the next tick (~1ms).
-// The producer goroutine detects the epoch change and resets its wall-clock
-// accounting to avoid stale deficits that would cause a burst or a stall.
+// Because the producer uses per-tick accounting, no reset is needed — the next
+// tick simply computes toEmit = newTPS * dt with no accumulated state to clear.
 func (r *RateLimiter) SetTPS(tps float64) {
 	if tps <= 0 {
 		tps = 0
 	}
 	r.tpsBits.Store(math.Float64bits(tps))
-	r.epoch.Add(1) // signal producer to reset accounting
 }
 
 // GetTPS returns the current target TPS.
