@@ -16,12 +16,14 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// ControlState holds a snapshot of the PI controller state for display.
+// ControlState holds a snapshot of the TPS scheduler state for display.
 type ControlState struct {
-	Delay     time.Duration
-	Tau       float64
-	Integral  float64
-	Saturated bool
+	SendQDepth    int64
+	LivePoolDepth int64
+	InFlight      int64
+	ActiveSess    int64
+	StarvedTokens int64
+	DroppedTokens int64
 }
 
 // Reporter outputs statistics to console and/or file.
@@ -235,7 +237,7 @@ func (r *Reporter) initCSV() error {
 		"est_req_sent", "est_req_success", "est_req_timeout",
 		"mod_req_sent", "mod_req_success", "mod_req_timeout",
 		"del_req_sent", "del_req_success", "del_req_timeout",
-		"delay_ms", "pi_integral", "pi_saturated",
+		"sendq_depth", "livepool_depth", "inflight", "starved_tokens", "dropped_tokens",
 	}
 	if err := r.csvWriter.Write(header); err != nil {
 		fd.Close()
@@ -275,16 +277,14 @@ func (r *Reporter) writeCSVRow(snap *CollectorSnapshot, currentTPS, avgTPS float
 	if r.getTargetTPS != nil {
 		displayTargetTPS = r.getTargetTPS()
 	}
-	var piDelayMs int64
-	var piIntegral float64
-	piSat := "false"
+	var sendQDepth, livePoolDepth, inFlight, starved, dropped int64
 	if fn := r.controlState.Load(); fn != nil {
 		cs := (*fn)()
-		piDelayMs = cs.Delay.Milliseconds()
-		piIntegral = cs.Integral
-		if cs.Saturated {
-			piSat = "true"
-		}
+		sendQDepth = cs.SendQDepth
+		livePoolDepth = cs.LivePoolDepth
+		inFlight = cs.InFlight
+		starved = cs.StarvedTokens
+		dropped = cs.DroppedTokens
 	}
 	row := []string{
 		time.Now().Format("2006-01-02T15:04:05.000"),
@@ -307,7 +307,8 @@ func (r *Reporter) writeCSVRow(snap *CollectorSnapshot, currentTPS, avgTPS float
 		fmt.Sprintf("%d", est.Sent), fmt.Sprintf("%d", est.Success), fmt.Sprintf("%d", est.Timeout),
 		fmt.Sprintf("%d", mod.Sent), fmt.Sprintf("%d", mod.Success), fmt.Sprintf("%d", mod.Timeout),
 		fmt.Sprintf("%d", del.Sent), fmt.Sprintf("%d", del.Success), fmt.Sprintf("%d", del.Timeout),
-		fmt.Sprintf("%d", piDelayMs), fmt.Sprintf("%.4f", piIntegral), piSat,
+		fmt.Sprintf("%d", sendQDepth), fmt.Sprintf("%d", livePoolDepth),
+		fmt.Sprintf("%d", inFlight), fmt.Sprintf("%d", starved), fmt.Sprintf("%d", dropped),
 	}
 	if err := r.csvWriter.Write(row); err != nil {
 		log.WithError(err).Warn("Failed to write CSV row")
@@ -517,19 +518,14 @@ func (r *Reporter) FormatDashboard() string {
 		fullRow(" Response   (no data)")
 	}
 
-	// ─── Control loop state ───
+	// ─── Scheduler state ───
 	fullSep("├", "─", "┤")
 	if fn := r.controlState.Load(); fn != nil {
 		cs := (*fn)()
-		sat := ""
-		if cs.Saturated {
-			sat = " [SATURATED]"
-		}
-		fullRow(fmt.Sprintf(" Control    Delay: %-10s τ: %-8s Integral: %-12s%s",
-			fmtRespTime(cs.Delay), fmt.Sprintf("%.1fs", cs.Tau),
-			fmt.Sprintf("%.2f", cs.Integral), sat))
+		fullRow(fmt.Sprintf(" Scheduler  SendQ:%-7d Pool:%-7d InFlt:%-7d Starved:%-6d Dropped:%d",
+			cs.SendQDepth, cs.LivePoolDepth, cs.InFlight, cs.StarvedTokens, cs.DroppedTokens))
 	} else {
-		fullRow(" Control    (no data)")
+		fullRow(" Scheduler  (no data)")
 	}
 
 	// ─── Message Type Table ───
