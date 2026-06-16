@@ -18,6 +18,7 @@ type Config struct {
 	Logging     LoggingConfig     `yaml:"logging"     mapstructure:"logging"`
 	Stats       StatsConfig       `yaml:"stats"       mapstructure:"stats"`
 	Stress      StressConfig      `yaml:"stress"      mapstructure:"stress"`
+	Metrics     MetricsConfig     `yaml:"metrics"     mapstructure:"metrics"`
 }
 
 type SMFConfig struct {
@@ -70,6 +71,14 @@ type StatsConfig struct {
 	ExportFile        string `yaml:"export_file"         mapstructure:"export_file"`
 }
 
+// MetricsConfig configures the Prometheus metrics exporter.
+type MetricsConfig struct {
+	Enabled bool   `yaml:"enabled" mapstructure:"enabled"`
+	Address string `yaml:"address" mapstructure:"address"`
+	Port    int    `yaml:"port"    mapstructure:"port"`
+	Path    string `yaml:"path"    mapstructure:"path"`
+}
+
 // StressConfig configures the high-performance stress test mode.
 type StressConfig struct {
 	Enabled        bool `yaml:"enabled"         mapstructure:"enabled"`
@@ -116,6 +125,10 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("stress.active_sessions", 10000)
 	v.SetDefault("stress.duration_sec", 0)
 	v.SetDefault("stress.control_port", 0)
+	v.SetDefault("metrics.enabled", false)
+	v.SetDefault("metrics.address", "0.0.0.0")
+	v.SetDefault("metrics.port", 9090)
+	v.SetDefault("metrics.path", "/metrics")
 }
 
 // Load reads configuration from a YAML file and returns a Config.
@@ -192,5 +205,8 @@ func (c *Config) Summary() string {
 	}
 	sb.WriteString(fmt.Sprintf("  Timeout:       %dms (retries: %d)\n", c.Timing.ResponseTimeoutMs, c.Timing.MaxRetries))
 	sb.WriteString(fmt.Sprintf("  Cleanup:       %v\n", c.Session.CleanupOnExit))
+	if c.Metrics.Enabled {
+		sb.WriteString(fmt.Sprintf("  Metrics:       http://%s:%d%s\n", c.Metrics.Address, c.Metrics.Port, c.Metrics.Path))
+	}
 	return sb.String()
 }

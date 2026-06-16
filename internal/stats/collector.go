@@ -121,6 +121,31 @@ func (h *ResponseTimeHistogram) Count() uint64 {
 	return h.count.Load()
 }
 
+// Sum returns the total of all observations in nanoseconds.
+func (h *ResponseTimeHistogram) Sum() int64 {
+	return h.sum.Load()
+}
+
+// CumulativeBuckets returns the upper bound (in nanoseconds) and cumulative
+// observation count for each histogram bucket, in ascending order. The last
+// bucket has no finite upper bound (it covers everything above the highest
+// boundary) and is reported with bound math.MaxInt64.
+func (h *ResponseTimeHistogram) CumulativeBuckets() (bounds []int64, cumulativeCounts []uint64) {
+	bounds = make([]int64, numBuckets)
+	cumulativeCounts = make([]uint64, numBuckets)
+	var cumulative uint64
+	for i := 0; i < numBuckets; i++ {
+		cumulative += h.buckets[i].Load()
+		cumulativeCounts[i] = cumulative
+		if i < len(histBoundaries) {
+			bounds[i] = histBoundaries[i]
+		} else {
+			bounds[i] = math.MaxInt64
+		}
+	}
+	return bounds, cumulativeCounts
+}
+
 // percentile uses linear interpolation within the bucket that contains the
 // target rank, producing smooth values instead of snapping to bucket boundaries.
 func (h *ResponseTimeHistogram) percentile(total uint64, pct float64) time.Duration {
