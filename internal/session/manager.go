@@ -3,7 +3,6 @@ package session
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"net"
 	"runtime"
 	"sync"
@@ -21,13 +20,6 @@ import (
 	"pfcp-generator/internal/stats"
 	"pfcp-generator/pkg/types"
 )
-
-// pendingSession is a session that has completed its lifecycle messages and is
-// waiting for its adaptive delay to expire before deletion is sent.
-type pendingSession struct {
-	session  *types.SessionInfo
-	deleteAt time.Time
-}
 
 // Manager orchestrates the PFCP session replay workflow.
 type Manager struct {
@@ -98,15 +90,15 @@ func NewManager(
 	modifier := pfcp.NewModifier(smfIP, cfg.Session.StripIPv6, cfg.Session.StripVendorIEs)
 
 	return &Manager{
-		cfg:                   cfg,
-		pool:                  pool,
-		receiver:              receiver,
-		tracker:               tracker,
-		modifier:              modifier,
-		seidAlloc:             seidAlloc,
-		ipPool:                ipPool,
-		stats:                 statsCollector,
-		seqCounter:            &SequenceCounter{},
+		cfg:                  cfg,
+		pool:                 pool,
+		receiver:             receiver,
+		tracker:              tracker,
+		modifier:             modifier,
+		seidAlloc:            seidAlloc,
+		ipPool:               ipPool,
+		stats:                statsCollector,
+		seqCounter:           &SequenceCounter{},
 		byOriginalCPSEID:     make(map[uint64]*types.SessionInfo),
 		byOriginalRemoteSEID: make(map[uint64]*types.SessionInfo),
 		byLocalSEID:          make(map[uint64]*types.SessionInfo),
@@ -185,28 +177,43 @@ func (m *Manager) Replay(ctx context.Context, messages []types.RawPFCPMessage) e
 	return nil
 }
 
-// adaptiveDelay manages the pre-deletion delay to keep active sessions at target.
-type adaptiveDelay struct {
-	delayNs atomic.Int64
+// ─── Stress Mode ─────────────────────────────────────────────────────────────
+
+// jobKind identifies the type of work in a scheduler job.
+type jobKind uint8
+
+const (
+	jobEstablish jobKind = iota
+	jobModify
+	jobDelete
+)
+
+// job is a unit of work dispatched by the scheduler to a sender goroutine.
+type job struct {
+	kind    jobKind
+	session *types.SessionInfo
+	tmplIdx int // template index (establish uses session.TemplateIdx; modify uses this field)
+	modIdx  int // index into tmpl.ModMsgs (for modify)
 }
 
-func (d *adaptiveDelay) Get() time.Duration {
-	return time.Duration(d.delayNs.Load())
-}
-
-func (d *adaptiveDelay) Set(v time.Duration) {
-	d.delayNs.Store(int64(v))
+// schedCounters holds atomic counters written by the scheduler for dashboard/logging.
+// The dashboard reads these from a separate goroutine, so they are atomic.
+type schedCounters struct {
+	sendQDepth    atomic.Int64
+	livePoolDepth atomic.Int64
+	inFlight      atomic.Int64
+	activeSess    atomic.Int64
+	starved       atomic.Int64
+	dropped       *atomic.Int64 // points into RateLimiter.Dropped
 }
 
 // ReplayStress runs a high-performance stress test using the given replay plan.
 //
-// TPS and active-sessions are read from params at runtime, allowing live tuning
-// via the control server without restarting.
-func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *control.StressParams, duration time.Duration) error {
-	tps := params.GetTPS()
-	activeSessions := params.GetActiveSessions()
-
-	// Send association setup once if present
+// TPS is the ultimate controlled variable: the rate limiter is the single authority
+// and nothing in the send path blocks on the network.  Active sessions are held in
+// a 60–100% band of the target by a five-rule priority scheduler; no PI controller
+// or adaptive delay is used.
+func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *control.StressParams, duration time.Duration, reporter *stats.Reporter) error {
 	if plan.AssociationSetup != nil && m.cfg.Association.Enabled {
 		msg, err := pfcp.Decode(plan.AssociationSetup.Data)
 		if err != nil {
@@ -217,11 +224,9 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 		}
 	}
 
-	// Create rate limiter with initial TPS
-	rateLimiter := NewRateLimiter(ctx, tps)
+	rateLimiter := NewRateLimiter(ctx, params.GetTPS())
 	defer rateLimiter.Stop()
 
-	// Timer for test duration
 	var testCtx context.Context
 	var testCancel context.CancelFunc
 	if duration > 0 {
@@ -231,13 +236,10 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 	}
 	defer testCancel()
 
-	// Pre-encode all templates once at startup.
 	preEncoded := BuildPreEncodedTemplates(plan.Templates, m.modifier)
 	if len(preEncoded) == 0 {
 		return fmt.Errorf("no templates could be pre-encoded")
 	}
-
-	// Pre-encode a deletion template once.
 	preEncodedDel, err := pfcp.PreEncodeDeletion()
 	if err != nil {
 		return fmt.Errorf("failed to pre-encode deletion template: %w", err)
@@ -247,208 +249,74 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 		"deletion_size": len(preEncodedDel.Data),
 	}).Info("Pre-encoded session templates")
 
-	// Session semaphore
-	sem := make(chan struct{}, activeSessions)
-
-	// pendingCh carries sessions waiting for the adaptive delay before deletion.
-	pendingCh := make(chan pendingSession, activeSessions)
-
-	// Work channel
-	workCh := make(chan int, activeSessions)
-
-	// Adaptive delay
-	delay := &adaptiveDelay{}
-
-	log.WithFields(log.Fields{
-		"msgs_per_session": plan.MessagesPerSession,
-	}).Info("Stress test starting")
-
-	var completedSessions atomic.Uint64
-	var failedSessions atomic.Uint64
-	var workersBlockedNet atomic.Int64
-	var workersBlockedRate atomic.Int64
-	var pendingDelSize atomic.Int64
-
-	// Compute steady-state values from actual pre-encoded templates.
-	// Each lifecycle = 1 establishment + N modifications + 1 deletion.
-	totalMsgsPerLifecycle := 0
-	for _, t := range preEncoded {
-		totalMsgsPerLifecycle += 1 + len(t.ModMsgs) + 1
-	}
-	avgMsgsPerLifecycle := float64(totalMsgsPerLifecycle) / float64(len(preEncoded))
-
-	// requiredDelay = targetActiveSessions * avgMsgsPerLifecycle / observedTPS
-	// At steady state: ActiveSessions = (TPS / avgMsgsPerLifecycle) * Delay
-	computeDelay := func(observedTPS float64, targetSess int) time.Duration {
-		creationRate := observedTPS / avgMsgsPerLifecycle
-		if creationRate <= 0 {
-			return 0
-		}
-		return time.Duration(float64(time.Second) * float64(targetSess) / creationRate)
+	target := params.GetActiveSessions()
+	if m.ipPool.TotalIPs() < 2*target {
+		log.Warnf("IP pool (%d IPs) < 2×target (%d); some establishes may fail at peak inFlight",
+			m.ipPool.TotalIPs(), 2*target)
 	}
 
-	// Initial estimate from target TPS (best guess before we have observed data).
-	initialDelay := computeDelay(tps, activeSessions)
-	naturalRampSec := initialDelay.Seconds()
+	const (
+		estSharedBuf   = 100_000
+		statsSharedBuf = 1 << 16 // 65536
+		estEventBuf    = 10_000
+		jobChFactor    = 4
+	)
+	estSharedCh       := make(chan types.TransactionResult, estSharedBuf)
+	statsSharedCh     := make(chan types.TransactionResult, statsSharedBuf)
+	establishedCh     := make(chan *types.SessionInfo, estEventBuf)
+	establishFailedCh := make(chan *types.SessionInfo, estEventBuf)
 
-	// Ramp-up configuration: 0 means use computed delay immediately (natural ramp).
-	// >0 means suppress deletions for that duration to front-load session creation.
-	rampUpSec := m.cfg.Stress.RampUpSec
+	numCPU := runtime.NumCPU()
+	senderCount := numCPU * 4
+	jobCh := make(chan job, jobChFactor*senderCount)
 
-	log.WithFields(log.Fields{
-		"initial_delay_ms":     initialDelay.Milliseconds(),
-		"natural_ramp_sec":     fmt.Sprintf("%.0f", naturalRampSec),
-		"ramp_up_sec":          rampUpSec,
-		"msgs_per_lifecycle":   fmt.Sprintf("%.1f", avgMsgsPerLifecycle),
-	}).Info("Computed initial steady-state parameters")
-
-	// Set initial delay from target TPS estimate.
-	delay.Set(initialDelay)
-
-	// Calibrator goroutine: recomputes delay from observed TPS every tick.
-	//
-	// The rate limiter controls TPS (caps at target, actual may be lower).
-	// The delay adapts to whatever TPS actually is, targeting the session count.
-	// One knob per target — no conflict.
-	//
-	// With rampUpSec>0: delay starts at 0 (deletions suppressed) for rampUpSec,
-	// then switches to adaptive computation.
-	go func() {
-		// Wait for first data before calibrating
-		select {
-		case <-testCtx.Done():
-			return
-		case <-time.After(3 * time.Second):
-		}
-
-		// If ramp-up requested, suppress deletions initially
-		if rampUpSec > 0 {
-			delay.Set(0)
-			log.WithField("ramp_up_sec", rampUpSec).Info("Ramp-up: suppressing deletions")
-
-			rampTimer := time.NewTimer(time.Duration(rampUpSec) * time.Second)
-			select {
-			case <-testCtx.Done():
-				rampTimer.Stop()
-				return
-			case <-rampTimer.C:
-				// Switch to adaptive — first tick will compute from observed TPS
-				log.WithField("active", m.stats.ActiveSessions.Load()).Info("Ramp-up complete, switching to adaptive delay")
+	ctrs := &schedCounters{dropped: &rateLimiter.Dropped}
+	if reporter != nil {
+		reporter.SetControlStateFunc(func() stats.ControlState {
+			return stats.ControlState{
+				SendQDepth:    ctrs.sendQDepth.Load(),
+				LivePoolDepth: ctrs.livePoolDepth.Load(),
+				InFlight:      ctrs.inFlight.Load(),
+				ActiveSess:    ctrs.activeSess.Load(),
+				StarvedTokens: ctrs.starved.Load(),
+				DroppedTokens: ctrs.dropped.Load(),
 			}
-		}
+		})
+	}
 
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
+	var wg sync.WaitGroup
 
-		var prevTPS float64
-		var prevActiveSessions int
-		prevTPS = tps
-		prevActiveSessions = activeSessions
+	for i := 0; i < numCPU; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.runEstablishCollector(testCtx, estSharedCh, establishedCh, establishFailedCh)
+		}()
+	}
 
-		// EMA-smoothed observed TPS (α=0.3: responsive but not jumpy)
-		const emaAlpha = 0.3
-		var smoothedTPS float64
-		var prevSent uint64
-		var prevTime time.Time
+	drainerCount := numCPU / 2
+	if drainerCount < 2 {
+		drainerCount = 2
+	}
+	for i := 0; i < drainerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.runStatsDrainer(testCtx, statsSharedCh)
+		}()
+	}
 
-		for {
-			select {
-			case <-testCtx.Done():
-				return
-			case <-ticker.C:
-				now := time.Now()
+	for i := 0; i < senderCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.runSender(testCtx, jobCh, preEncoded, preEncodedDel, estSharedCh, statsSharedCh)
+		}()
+	}
 
-				// Check for runtime parameter changes
-				currentTargetTPS := params.GetTPS()
-				currentTargetSessions := params.GetActiveSessions()
-
-				if currentTargetTPS != prevTPS {
-					rateLimiter.SetTPS(currentTargetTPS)
-					log.WithFields(log.Fields{
-						"old_tps": fmt.Sprintf("%.0f", prevTPS),
-						"new_tps": fmt.Sprintf("%.0f", currentTargetTPS),
-					}).Info("Target TPS changed at runtime")
-					prevTPS = currentTargetTPS
-				}
-				if currentTargetSessions != prevActiveSessions {
-					log.WithFields(log.Fields{
-						"old_sessions": prevActiveSessions,
-						"new_sessions": currentTargetSessions,
-					}).Info("Target active sessions changed at runtime")
-					prevActiveSessions = currentTargetSessions
-				}
-
-				// Measure observed TPS over last tick interval
-				totalSent := m.stats.TotalSent()
-				var instantTPS float64
-				if !prevTime.IsZero() {
-					dt := now.Sub(prevTime).Seconds()
-					if dt > 0 {
-						instantTPS = float64(totalSent-prevSent) / dt
-					}
-				}
-				prevSent = totalSent
-				prevTime = now
-
-				if instantTPS <= 0 {
-					continue
-				}
-
-				// Update EMA
-				if smoothedTPS == 0 {
-					smoothedTPS = instantTPS
-				} else {
-					smoothedTPS = emaAlpha*instantTPS + (1-emaAlpha)*smoothedTPS
-				}
-
-				// Base delay from target TPS — this is the ideal steady state.
-				baseDelay := computeDelay(currentTargetTPS, currentTargetSessions)
-
-				// If observed TPS is persistently below target (system can't keep up),
-				// increase delay proportionally so sessions still reach target count.
-				// But only apply this correction when sessions are below target —
-				// if sessions are already at/above target, we must NOT increase delay
-				// further or we create a death spiral (TPS drops → delay up → feeder
-				// blocked → TPS drops more).
-				activeCount := int(m.stats.ActiveSessions.Load())
-				sessionRatio := float64(activeCount) / float64(currentTargetSessions)
-				tpsRatio := smoothedTPS / currentTargetTPS
-
-				requiredDelay := baseDelay
-
-				if tpsRatio < 0.90 && sessionRatio < 0.95 {
-					// System can't reach target TPS and sessions still below target:
-					// scale delay up so fewer sessions = target TPS can fill them.
-					// delay = targetSessions * msgsPerLifecycle / observedTPS
-					requiredDelay = computeDelay(smoothedTPS, currentTargetSessions)
-				} else if sessionRatio > 1.10 {
-					// Too many sessions — reduce delay to drain faster
-					requiredDelay = time.Duration(float64(baseDelay) * 0.80)
-				}
-
-				// Floor: delay must be non-negative
-				if requiredDelay < 0 {
-					requiredDelay = 0
-				}
-
-				delay.Set(requiredDelay)
-
-				log.WithFields(log.Fields{
-					"observed_tps": fmt.Sprintf("%.0f", smoothedTPS),
-					"target_tps":   fmt.Sprintf("%.0f", currentTargetTPS),
-					"tps_ratio":    fmt.Sprintf("%.2f", tpsRatio),
-					"target_sess":  currentTargetSessions,
-					"active":       activeCount,
-					"sess_ratio":   fmt.Sprintf("%.2f", sessionRatio),
-					"delay_ms":     requiredDelay.Milliseconds(),
-					"base_ms":      baseDelay.Milliseconds(),
-				}).Debug("Adaptive delay calibration")
-			}
-		}
-	}()
-
-	// Periodic progress logging
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -458,488 +326,355 @@ func (m *Manager) ReplayStress(ctx context.Context, plan *ReplayPlan, params *co
 			case <-ticker.C:
 				elapsed := m.stats.Duration()
 				totalSent := m.stats.TotalSent()
-				currentTPS := float64(0)
+				var currentTPS float64
 				if elapsed.Seconds() > 0 {
 					currentTPS = float64(totalSent) / elapsed.Seconds()
 				}
 				_, _, _, _, _, rttP99 := m.stats.ResponseTimes.Stats()
 				log.WithFields(log.Fields{
-					"completed":    completedSessions.Load(),
-					"failed":       failedSessions.Load(),
-					"active":       m.stats.ActiveSessions.Load(),
-					"total_sent":   totalSent,
-					"delay_ms":     delay.Get().Milliseconds(),
-					"current_tps":  fmt.Sprintf("%.0f", currentTPS),
-					"target_tps":   fmt.Sprintf("%.0f", params.GetTPS()),
-					"target_sess":  params.GetActiveSessions(),
-					"elapsed":      elapsed.Round(time.Second),
-					"workers_net":  workersBlockedNet.Load(),
-					"workers_rate": workersBlockedRate.Load(),
-					"pending_del":  pendingDelSize.Load(),
-					"rtt_p99_ms":   rttP99.Milliseconds(),
+					"active":      ctrs.activeSess.Load(),
+					"target":      params.GetActiveSessions(),
+					"inflight":    ctrs.inFlight.Load(),
+					"sendq":       ctrs.sendQDepth.Load(),
+					"livepool":    ctrs.livePoolDepth.Load(),
+					"starved":     ctrs.starved.Load(),
+					"dropped":     ctrs.dropped.Load(),
+					"total_sent":  totalSent,
+					"current_tps": fmt.Sprintf("%.0f", currentTPS),
+					"target_tps":  fmt.Sprintf("%.0f", params.GetTPS()),
+					"elapsed":     elapsed.Round(time.Second),
+					"rtt_p99_ms":  rttP99.Milliseconds(),
 				}).Info("Stress test progress")
 			}
 		}
 	}()
 
-	// Deletion dispatcher (FIFO ring buffer)
-	go m.runDeletionDispatcher(testCtx, pendingCh, sem, rateLimiter, preEncodedDel, &failedSessions, &pendingDelSize)
-
-	// Feeder goroutine: pushes session templates to workers as sem slots become available.
-	// Session count is controlled by the delay (how long sessions live before deletion),
-	// not by the feeder. The semaphore caps in-flight sessions at activeSessions.
-	go func() {
-		defer close(workCh)
-		templateCount := len(preEncoded)
-		idx := 0
-		for {
-			select {
-			case <-testCtx.Done():
-				return
-			case sem <- struct{}{}:
-				select {
-				case workCh <- idx % templateCount:
-					idx++
-				case <-testCtx.Done():
-					<-sem
-					return
-				}
-			}
-		}
-	}()
-
-	// Worker pool with autoscaler
-	const (
-		scaleUpThreshold = 0.80
-		scaleInterval    = 2 * time.Second
-	)
-	maxWorkers := int(tps * 0.3)
-	if maxWorkers < 2000 {
-		maxWorkers = 2000
-	}
-	if maxWorkers > 12000 {
-		maxWorkers = 12000
-	}
-	initialWorkers := int(tps * 0.030)
-	if initialWorkers < runtime.NumCPU()*4 {
-		initialWorkers = runtime.NumCPU() * 4
-	}
-	if initialWorkers > maxWorkers {
-		initialWorkers = maxWorkers
-	}
-
-	var activeWorkerCount atomic.Int64
-	var wg sync.WaitGroup
-
-	spawnWorker := func() {
-		wg.Add(1)
-		activeWorkerCount.Add(1)
-		go func() {
-			defer wg.Done()
-			defer activeWorkerCount.Add(-1)
-			for tmplIdx := range workCh {
-				tmpl := &preEncoded[tmplIdx]
-				err := m.executeStressSession(testCtx, tmpl, rateLimiter, delay, pendingCh,
-					&workersBlockedRate, &workersBlockedNet)
-				if err != nil {
-					if testCtx.Err() != nil {
-						<-sem
-						return
-					}
-					failedSessions.Add(1)
-					log.WithError(err).Debug("Session failed")
-					<-sem
-				} else {
-					completedSessions.Add(1)
-				}
-			}
-		}()
-	}
-
 	log.WithFields(log.Fields{
-		"initial_workers": initialWorkers,
-		"max_workers":     maxWorkers,
-		"active_sessions": activeSessions,
-		"target_tps":      tps,
-	}).Info("Starting stress workers")
+		"target_tps":      params.GetTPS(),
+		"target_sessions": target,
+		"senders":         senderCount,
+		"collectors":      numCPU,
+		"drainers":        drainerCount,
+	}).Info("Stress test starting")
 
-	for w := 0; w < initialWorkers; w++ {
-		spawnWorker()
-	}
+	m.runScheduler(testCtx, rateLimiter, params, preEncoded, jobCh, establishedCh, establishFailedCh, ctrs)
 
-	// Autoscaler
-	go func() {
-		ticker := time.NewTicker(scaleInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-testCtx.Done():
-				return
-			case <-ticker.C:
-				cur := activeWorkerCount.Load()
-				if cur <= 0 || cur >= int64(maxWorkers) {
-					continue
-				}
-				netBlocked := workersBlockedNet.Load()
-				utilization := float64(netBlocked) / float64(cur)
-				if utilization < scaleUpThreshold {
-					continue
-				}
-				needed := int64(float64(netBlocked) / 0.65)
-				if needed <= cur {
-					needed = int64(float64(cur) * 1.3)
-				}
-				if needed > int64(maxWorkers) {
-					needed = int64(maxWorkers)
-				}
-				toAdd := needed - cur
-				if toAdd < 4 {
-					toAdd = 4
-				}
-				for i := int64(0); i < toAdd; i++ {
-					spawnWorker()
-				}
-				log.WithFields(log.Fields{
-					"added":       toAdd,
-					"total":       cur + toAdd,
-					"utilization": fmt.Sprintf("%.0f%%", utilization*100),
-					"net_blocked": netBlocked,
-				}).Info("Autoscaled worker pool")
-			}
-		}
-	}()
-
+	close(jobCh)
 	wg.Wait()
 
-	log.WithFields(log.Fields{
-		"completed":      completedSessions.Load(),
-		"failed":         failedSessions.Load(),
-		"final_delay_ms": delay.Get().Milliseconds(),
-	}).Info("Stress test completed")
-
+	log.Info("Stress test completed")
 	return nil
 }
 
-// runDeletionDispatcher manages deferred session deletions using a FIFO ring buffer.
-func (m *Manager) runDeletionDispatcher(
+// runScheduler is the single goroutine that owns all scheduling queues and counters.
+// It consumes one rate-limiter token per iteration and dispatches exactly one job.
+// Nothing in this path blocks on the network; all I/O happens in runSender.
+func (m *Manager) runScheduler(
 	ctx context.Context,
-	pendingCh <-chan pendingSession,
-	sem chan struct{},
-	rateLimiter *RateLimiter,
-	preEncodedDel *pfcp.PreEncodedMsg,
-	failedSessions *atomic.Uint64,
-	pendingDelSize *atomic.Int64,
+	rl *RateLimiter,
+	params *control.StressParams,
+	preEncoded []PreEncodedTemplate,
+	jobCh chan<- job,
+	establishedCh <-chan *types.SessionInfo,
+	establishFailedCh <-chan *types.SessionInfo,
+	ctrs *schedCounters,
 ) {
-	const initialCap = 1 << 20
-	ring := make([]pendingSession, initialCap)
-	head := 0
-	tail := 0
-	count := 0
+	var (
+		sendQ    []*types.SessionInfo // sessions with pending mods
+		livePool []*types.SessionInfo // active sessions ready for deletion (FIFO)
 
-	// Cap deletions per 5ms tick to avoid flooding the rate limiter.
-	// At most 30% of target TPS goes to deletions. With 5ms tick interval
-	// that's targetTPS * 0.30 / 200 per tick. Floor at 50 to avoid starvation.
-	targetTPS := m.cfg.Stress.TPS
-	maxDrainPerTick := targetTPS * 30 / 100 / 200 // 30% of TPS / 200 ticks per sec
-	if maxDrainPerTick < 50 {
-		maxDrainPerTick = 50
-	}
+		activeSessions int // established, delete-send not yet dispatched
+		inFlight       int // SEID/IP allocated, not yet freed
+		tmplIdx        int // round-robin template counter
+		starved        int64
 
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer ticker.Stop()
+		target      = params.GetActiveSessions()
+		curTPS      = params.GetTPS()
+		maxInFlight = 2 * target
 
-	delBuf := make([]byte, len(preEncodedDel.Data))
+		lastParamCheck time.Time
+	)
+	n := len(preEncoded)
 
-	sendDeletion := func(s *types.SessionInfo, buf []byte) {
-		seqNum := m.seqCounter.Next()
-		preEncodedDel.ApplyInto(buf, seqNum, s.RemoteSEID, 0, nil)
-
-		data := make([]byte, len(buf))
-		copy(data, buf)
-
-		m.stats.RecordSent("SessionDeletionRequest")
-		portIdx := m.pool.NextPortIndex()
-
-		m.tracker.Track(seqNum, data, portIdx)
-
-		if err := m.pool.SendOn(portIdx, data); err != nil {
-			failedSessions.Add(1)
-		} else {
-			m.stats.RecordSessionDeleted()
+	for {
+		// Drain event channels non-blocking before each token wait.
+	drainEvents:
+		for {
+			select {
+			case sess := <-establishedCh:
+				activeSessions++
+				if sess.ModsRemaining > 0 {
+					sendQ = append(sendQ, sess)
+				} else {
+					livePool = append(livePool, sess)
+				}
+			case sess := <-establishFailedCh:
+				inFlight-- // collector already released SEID/IP
+				_ = sess
+			default:
+				break drainEvents
+			}
 		}
 
-		m.releaseSessionStress(s)
-		<-sem
-	}
-
-	grow := func() {
-		newCap := len(ring) * 2
-		newRing := make([]pendingSession, newCap)
-		if head <= tail {
-			copy(newRing, ring[head:tail])
-		} else {
-			n := copy(newRing, ring[head:])
-			copy(newRing[n:], ring[:tail])
-		}
-		ring = newRing
-		head = 0
-		tail = count
-		log.WithFields(log.Fields{
-			"old_cap": len(ring) / 2,
-			"new_cap": newCap,
-			"count":   count,
-		}).Info("Deletion ring buffer grew")
-	}
-
-	drainDue := func() {
+		// Re-read params and publish counters ~every second.
 		now := time.Now()
-		drained := 0
-		for count > 0 && drained < maxDrainPerTick {
-			entry := &ring[head]
-			if entry.deleteAt.After(now) {
-				break
+		if now.Sub(lastParamCheck) >= time.Second {
+			newTPS := params.GetTPS()
+			if newTPS != curTPS {
+				rl.SetTPS(newTPS)
+				log.WithFields(log.Fields{"old": curTPS, "new": newTPS}).Info("Target TPS changed")
+				curTPS = newTPS
+			}
+			newTarget := params.GetActiveSessions()
+			if newTarget != target {
+				log.WithFields(log.Fields{"old": target, "new": newTarget}).Info("Target sessions changed")
+				target = newTarget
+				maxInFlight = 2 * target
+			}
+			ctrs.sendQDepth.Store(int64(len(sendQ)))
+			ctrs.livePoolDepth.Store(int64(len(livePool)))
+			ctrs.inFlight.Store(int64(inFlight))
+			ctrs.activeSess.Store(int64(activeSessions))
+			ctrs.starved.Store(starved)
+			lastParamCheck = now
+		}
+
+		// Wait for one token — the only place the scheduler sleeps.
+		if err := rl.Wait(ctx); err != nil {
+			return
+		}
+
+		// Five-rule priority decision (O(1) in-memory, no network I/O).
+		if len(sendQ) > 0 {
+			// P1: drain ready modifications (sessions that already have RemoteSEID).
+			sess := sendQ[0]
+			sendQ = sendQ[1:]
+			modIdx := sess.NextModIdx
+			sess.NextModIdx++
+			sess.ModsRemaining--
+			select {
+			case jobCh <- job{kind: jobModify, session: sess, tmplIdx: sess.TemplateIdx, modIdx: modIdx}:
+			case <-ctx.Done():
+				return
+			}
+			if sess.ModsRemaining > 0 {
+				sendQ = append(sendQ, sess)
+			} else {
+				livePool = append(livePool, sess)
 			}
 
-			// Non-blocking only. Workers are always running and consuming
-			// tokens via Wait(), so the token channel doesn't stagnate.
-			// Overdue entries retry on the next 5ms tick.
-			if !rateLimiter.TryWait() {
-				break
+		} else if activeSessions >= target && len(livePool) > 0 {
+			// P2: at or above session ceiling — delete oldest.
+			sess := livePool[0]
+			livePool = livePool[1:]
+			activeSessions--
+			inFlight--
+			select {
+			case jobCh <- job{kind: jobDelete, session: sess}:
+			case <-ctx.Done():
+				return
 			}
 
-			pendingDelSize.Add(-1)
-			drained++
-			sendDeletion(entry.session, delBuf)
+		} else if activeSessions < target && inFlight < maxInFlight {
+			// P3: below target — start a new establish.
+			localSEID, err := m.seidAlloc.Allocate()
+			if err != nil {
+				starved++
+			} else if ueIP, err := m.ipPool.Allocate(); err != nil {
+				m.seidAlloc.Release(localSEID)
+				starved++
+			} else {
+				ti := tmplIdx % n
+				sess := &types.SessionInfo{
+					LocalSEID:     localSEID,
+					UEIP:          ueIP,
+					TemplateIdx:   ti,
+					ModsRemaining: len(preEncoded[ti].ModMsgs),
+					NextModIdx:    0,
+					State:         "establishing",
+					CreatedAt:     time.Now(),
+				}
+				tmplIdx++
+				inFlight++
+				select {
+				case jobCh <- job{kind: jobEstablish, session: sess}:
+				case <-ctx.Done():
+					m.seidAlloc.Release(localSEID)
+					m.ipPool.Release(ueIP)
+					inFlight--
+					return
+				}
+			}
 
-			head = (head + 1) % len(ring)
-			count--
+		} else if len(livePool) > 0 {
+			// P4: band full or inFlight at cap — churn-delete to keep TPS alive.
+			sess := livePool[0]
+			livePool = livePool[1:]
+			activeSessions--
+			inFlight--
+			select {
+			case jobCh <- job{kind: jobDelete, session: sess}:
+			case <-ctx.Done():
+				return
+			}
+
+		} else {
+			// P5: nothing actionable — forfeit token.
+			starved++
 		}
 	}
+}
 
+// runSender reads jobs from jobCh and executes them as fire-and-forget UDP sends.
+// It never blocks waiting for a response; all response handling happens elsewhere.
+func (m *Manager) runSender(
+	ctx context.Context,
+	jobCh <-chan job,
+	preEncoded []PreEncodedTemplate,
+	preEncodedDel *pfcp.PreEncodedMsg,
+	estSharedCh chan types.TransactionResult,
+	statsSharedCh chan types.TransactionResult,
+) {
 	for {
 		select {
 		case <-ctx.Done():
-			for count > 0 {
-				head = (head + 1) % len(ring)
-				count--
-				<-sem
-			}
 			return
-
-		case pd, ok := <-pendingCh:
+		case j, ok := <-jobCh:
 			if !ok {
 				return
 			}
-			if count == len(ring) {
-				grow()
-			}
-			ring[tail] = pd
-			tail = (tail + 1) % len(ring)
-			count++
-			pendingDelSize.Add(1)
-
-			for i := 0; i < 256; i++ {
-				select {
-				case pd, ok := <-pendingCh:
-					if !ok {
-						drainDue()
-						return
-					}
-					if count == len(ring) {
-						grow()
-					}
-					ring[tail] = pd
-					tail = (tail + 1) % len(ring)
-					count++
-					pendingDelSize.Add(1)
-				default:
-					goto doneReceiving
+			switch j.kind {
+			case jobEstablish:
+				tmpl := &preEncoded[j.session.TemplateIdx]
+				seqNum := m.seqCounter.Next()
+				data := make([]byte, len(tmpl.EstMsg.Data))
+				tmpl.EstMsg.ApplyInto(data, seqNum, 0, j.session.LocalSEID, j.session.UEIP)
+				m.stats.RecordSent("SessionEstablishmentRequest")
+				portIdx := m.pool.NextPortIndex()
+				m.tracker.TrackWith(seqNum, data, portIdx, j.session, "SessionEstablishmentRequest", estSharedCh)
+				if err := m.pool.SendOn(portIdx, data); err != nil {
+					log.WithError(err).Debug("Failed to send Session Establishment")
 				}
-			}
-		doneReceiving:
-			drainDue()
 
-		case <-ticker.C:
-			drainDue()
+			case jobModify:
+				tmpl := &preEncoded[j.tmplIdx]
+				modMsg := tmpl.ModMsgs[j.modIdx]
+				seqNum := m.seqCounter.Next()
+				data := make([]byte, len(modMsg.Data))
+				modMsg.ApplyInto(data, seqNum, j.session.RemoteSEID, 0, j.session.UEIP)
+				m.stats.RecordSent("SessionModificationRequest")
+				portIdx := m.pool.NextPortIndex()
+				m.tracker.TrackWith(seqNum, data, portIdx, j.session, "SessionModificationRequest", statsSharedCh)
+				if err := m.pool.SendOn(portIdx, data); err != nil {
+					log.WithError(err).Debug("Failed to send Session Modification")
+				}
+
+			case jobDelete:
+				seqNum := m.seqCounter.Next()
+				data := make([]byte, len(preEncodedDel.Data))
+				preEncodedDel.ApplyInto(data, seqNum, j.session.RemoteSEID, 0, nil)
+				m.stats.RecordSent("SessionDeletionRequest")
+				portIdx := m.pool.NextPortIndex()
+				m.tracker.TrackWith(seqNum, data, portIdx, j.session, "SessionDeletionRequest", statsSharedCh)
+				if err := m.pool.SendOn(portIdx, data); err != nil {
+					log.WithError(err).Debug("Failed to send Session Deletion")
+				}
+				m.stats.RecordSessionDeleted()
+				m.releaseSessionStress(j.session)
+			}
 		}
 	}
 }
 
-// executeStressSession runs a session lifecycle using pre-encoded byte templates.
-func (m *Manager) executeStressSession(
+// runEstablishCollector drains estSharedCh, extracts RemoteSEID from responses,
+// and emits the session to establishedCh or establishFailedCh for the scheduler.
+func (m *Manager) runEstablishCollector(
 	ctx context.Context,
-	tmpl *PreEncodedTemplate,
-	rateLimiter *RateLimiter,
-	delay *adaptiveDelay,
-	pendingCh chan<- pendingSession,
-	workersBlockedRate *atomic.Int64,
-	workersBlockedNet *atomic.Int64,
-) error {
-	// 1. Establish
-	workersBlockedRate.Add(1)
-	err := rateLimiter.Wait(ctx)
-	workersBlockedRate.Add(-1)
-	if err != nil {
-		return err
-	}
-	session, err := m.establishFromPreEncoded(ctx, tmpl.EstMsg, workersBlockedNet)
-	if err != nil {
-		return err
-	}
-
-	// 2. Fire all modifications without waiting (pipelined).
-	modResults := make([]<-chan types.TransactionResult, 0, len(tmpl.ModMsgs))
-	for _, modMsg := range tmpl.ModMsgs {
-		workersBlockedRate.Add(1)
-		err := rateLimiter.Wait(ctx)
-		workersBlockedRate.Add(-1)
-		if err != nil {
-			m.cleanupStressSession(ctx, session)
-			return err
-		}
-		ch, sendErr := m.firePreEncodedModification(modMsg, session)
-		if sendErr != nil {
-			if ctx.Err() != nil {
-				m.cleanupStressSession(ctx, session)
-				return ctx.Err()
+	estSharedCh <-chan types.TransactionResult,
+	establishedCh chan<- *types.SessionInfo,
+	establishFailedCh chan<- *types.SessionInfo,
+) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case result, ok := <-estSharedCh:
+			if !ok {
+				return
 			}
-			log.WithError(sendErr).Debug("Modification send failed")
-			continue
-		}
-		modResults = append(modResults, ch)
-	}
+			sess := result.Owner
+			if sess == nil {
+				continue
+			}
 
-	// Collect all modification responses.
-	if len(modResults) > 0 {
-		workersBlockedNet.Add(1)
-		for _, ch := range modResults {
-			result := m.waitForResult(ctx, ch)
 			if result.Error != nil {
-				if ctx.Err() != nil {
-					workersBlockedNet.Add(-1)
-					m.cleanupStressSession(ctx, session)
-					return ctx.Err()
+				m.stats.RecordTimeout("SessionEstablishmentRequest")
+				m.stats.RecordSessionFailed()
+				m.releaseSessionStress(sess)
+				select {
+				case establishFailedCh <- sess:
+				case <-ctx.Done():
+					return
 				}
-				m.stats.RecordTimeout("SessionModificationRequest")
-			} else {
-				m.stats.RecordReceived("SessionModificationResponse")
-				m.stats.RecordSuccess("SessionModificationRequest", result.ResponseTime)
+				continue
+			}
+
+			m.stats.RecordReceived("SessionEstablishmentResponse")
+			remoteSEID, cause, err := pfcp.ExtractEstablishmentResponseFast(result.Response)
+			if err != nil || cause != pfcp.CauseRequestAccepted {
+				m.stats.RecordFailure("SessionEstablishmentRequest")
+				m.stats.RecordSessionFailed()
+				m.releaseSessionStress(sess)
+				select {
+				case establishFailedCh <- sess:
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
+
+			m.stats.RecordSuccess("SessionEstablishmentRequest", result.ResponseTime)
+			m.stats.RecordSessionEstablished()
+			sess.RemoteSEID = remoteSEID
+			sess.State = "established"
+			select {
+			case establishedCh <- sess:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// runStatsDrainer reads mod/delete results from statsSharedCh and records stats.
+// It is stats-only and never signals the scheduler.
+func (m *Manager) runStatsDrainer(ctx context.Context, statsSharedCh <-chan types.TransactionResult) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case result, ok := <-statsSharedCh:
+			if !ok {
+				return
+			}
+			if result.Error != nil {
+				m.stats.RecordTimeout(result.MsgType)
+				continue
+			}
+			// Derive response type: "...Request" → "...Response"
+			reqType := result.MsgType
+			if len(reqType) > 7 {
+				m.stats.RecordReceived(reqType[:len(reqType)-7] + "Response")
+			}
+			m.stats.RecordSuccess(result.MsgType, result.ResponseTime)
+			if result.MsgType == "SessionModificationRequest" {
 				m.stats.RecordSessionModified()
 			}
 		}
-		workersBlockedNet.Add(-1)
-	}
-
-	// 3. Push to deletion dispatcher with jittered delay.
-	d := delay.Get()
-	deleteAt := time.Now()
-	if d > 0 {
-		deleteAt = deleteAt.Add(time.Duration(float64(d) * (0.5 + rand.Float64())))
-	}
-	select {
-	case pendingCh <- pendingSession{session: session, deleteAt: deleteAt}:
-		return nil
-	case <-ctx.Done():
-		m.cleanupStressSession(ctx, session)
-		return ctx.Err()
 	}
 }
 
-// establishFromPreEncoded sends a pre-encoded Session Establishment Request.
-func (m *Manager) establishFromPreEncoded(ctx context.Context, pre *pfcp.PreEncodedMsg, workersBlockedNet *atomic.Int64) (*types.SessionInfo, error) {
-	localSEID, err := m.seidAlloc.Allocate()
-	if err != nil {
-		m.stats.RecordSessionFailed()
-		return nil, fmt.Errorf("failed to allocate SEID: %w", err)
-	}
-
-	ueIP, err := m.ipPool.Allocate()
-	if err != nil {
-		m.seidAlloc.Release(localSEID)
-		m.stats.RecordSessionFailed()
-		return nil, fmt.Errorf("failed to allocate UE IP: %w", err)
-	}
-
-	session := &types.SessionInfo{
-		LocalSEID: localSEID,
-		UEIP:      ueIP,
-		State:     "establishing",
-		CreatedAt: time.Now(),
-	}
-
-	seqNum := m.seqCounter.Next()
-
-	data := make([]byte, len(pre.Data))
-	pre.ApplyInto(data, seqNum, 0, localSEID, ueIP)
-
-	msgTypeName := "SessionEstablishmentRequest"
-	m.stats.RecordSent(msgTypeName)
-	portIdx := m.pool.NextPortIndex()
-	resultCh := m.tracker.Track(seqNum, data, portIdx)
-
-	if err := m.pool.SendOn(portIdx, data); err != nil {
-		return nil, fmt.Errorf("failed to send Session Establishment: %w", err)
-	}
-
-	workersBlockedNet.Add(1)
-	result := m.waitForResult(ctx, resultCh)
-	workersBlockedNet.Add(-1)
-	if result.Error != nil {
-		m.stats.RecordTimeout(msgTypeName)
-		m.stats.RecordSessionFailed()
-		return nil, fmt.Errorf("Session Establishment timeout: %w", result.Error)
-	}
-
-	m.stats.RecordReceived("SessionEstablishmentResponse")
-
-	remoteSEID, cause, err := pfcp.ExtractEstablishmentResponseFast(result.Response)
-	if err != nil {
-		m.stats.RecordFailure(msgTypeName)
-		m.stats.RecordSessionFailed()
-		return nil, fmt.Errorf("failed to parse Establishment Response: %w", err)
-	}
-
-	if cause != pfcp.CauseRequestAccepted {
-		m.stats.RecordFailure(msgTypeName)
-		m.stats.RecordSessionFailed()
-		return nil, fmt.Errorf("Session Establishment rejected with cause %d", cause)
-	}
-
-	session.RemoteSEID = remoteSEID
-	session.State = "established"
-
-	m.stats.RecordSuccess(msgTypeName, result.ResponseTime)
-	m.stats.RecordSessionEstablished()
-
-	log.WithFields(log.Fields{
-		"seq_num":       seqNum,
-		"local_seid":    localSEID,
-		"remote_seid":   remoteSEID,
-		"ue_ip":         ueIP,
-		"response_time": result.ResponseTime.Round(time.Microsecond),
-	}).Debug("Session established")
-
-	return session, nil
-}
-
-// firePreEncodedModification sends a pre-encoded Session Modification Request
-// and returns the result channel without waiting.
-func (m *Manager) firePreEncodedModification(pre *pfcp.PreEncodedMsg, session *types.SessionInfo) (<-chan types.TransactionResult, error) {
-	seqNum := m.seqCounter.Next()
-
-	data := make([]byte, len(pre.Data))
-	pre.ApplyInto(data, seqNum, session.RemoteSEID, 0, session.UEIP)
-
-	m.stats.RecordSent("SessionModificationRequest")
-	portIdx := m.pool.NextPortIndex()
-	resultCh := m.tracker.Track(seqNum, data, portIdx)
-
-	if err := m.pool.SendOn(portIdx, data); err != nil {
-		return nil, fmt.Errorf("failed to send Session Modification: %w", err)
-	}
-
-	return resultCh, nil
-}
+// ─── Sequential Replay helpers ───────────────────────────────────────────────
 
 // establishFromRaw decodes a raw establishment message and establishes the session.
 func (m *Manager) establishFromRaw(ctx context.Context, raw types.RawPFCPMessage) (*types.SessionInfo, error) {
@@ -1428,38 +1163,6 @@ func (m *Manager) sendSessionDeletion(ctx context.Context, session *types.Sessio
 	m.stats.RecordSessionDeleted()
 
 	m.releaseSession(session)
-	return nil
-}
-
-func (m *Manager) sendSessionDeletionStress(ctx context.Context, session *types.SessionInfo) error {
-	seqNum := m.seqCounter.Next()
-	req := message.NewSessionDeletionRequest(0, 0, session.RemoteSEID, seqNum, 0)
-
-	data, err := pfcp.Encode(req)
-	if err != nil {
-		return fmt.Errorf("failed to encode auto-deletion: %w", err)
-	}
-
-	msgTypeName := "SessionDeletionRequest"
-	m.stats.RecordSent(msgTypeName)
-	portIdx := m.pool.NextPortIndex()
-	resultCh := m.tracker.Track(seqNum, data, portIdx)
-
-	if err := m.pool.SendOn(portIdx, data); err != nil {
-		return fmt.Errorf("failed to send auto-deletion: %w", err)
-	}
-
-	result := m.waitForResult(ctx, resultCh)
-	if result.Error != nil {
-		m.stats.RecordTimeout(msgTypeName)
-		return fmt.Errorf("auto-deletion timeout: %w", result.Error)
-	}
-
-	m.stats.RecordReceived("SessionDeletionResponse")
-	m.stats.RecordSuccess(msgTypeName, result.ResponseTime)
-	m.stats.RecordSessionDeleted()
-
-	m.releaseSessionStress(session)
 	return nil
 }
 

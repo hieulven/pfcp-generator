@@ -26,6 +26,12 @@ type PendingTransaction struct {
 	SentAt      time.Time
 	RetryCount  int
 	ResultCh    chan types.TransactionResult
+	// Owner is the originating session for TrackWith registrations.
+	Owner *types.SessionInfo
+	// MsgType names the request type for stats propagation.
+	MsgType string
+	// SharedCh marks a shared channel: push is non-blocking (drop on full).
+	SharedCh bool
 }
 
 type txShard struct {
@@ -58,7 +64,7 @@ func (t *TransactionTracker) shard(seqNum uint32) *txShard {
 	return &t.shards[seqNum%numShards]
 }
 
-// Track registers a new pending transaction and returns a channel for the result.
+// Track registers a new pending transaction and returns a per-transaction result channel.
 // portIndex identifies which source port was used (for retransmission on the same port).
 func (t *TransactionTracker) Track(seqNum uint32, requestData []byte, portIndex int) <-chan types.TransactionResult {
 	s := t.shard(seqNum)
@@ -77,6 +83,40 @@ func (t *TransactionTracker) Track(seqNum uint32, requestData []byte, portIndex 
 	return resultCh
 }
 
+// TrackWith registers a pending transaction that resolves into a shared channel.
+// owner is attached to the result so the collector needs no seq→session map.
+// msgType names the request type for stats draining.
+// The push to shared is non-blocking: drops are preferred over stalling handleResponses.
+func (t *TransactionTracker) TrackWith(seqNum uint32, requestData []byte, portIndex int, owner *types.SessionInfo, msgType string, shared chan types.TransactionResult) {
+	s := t.shard(seqNum)
+	s.mu.Lock()
+	s.pending[seqNum] = &PendingTransaction{
+		SeqNum:      seqNum,
+		RequestData: requestData,
+		PortIndex:   portIndex,
+		SentAt:      time.Now(),
+		ResultCh:    shared,
+		Owner:       owner,
+		MsgType:     msgType,
+		SharedCh:    true,
+	}
+	s.mu.Unlock()
+}
+
+// send pushes result to tx.ResultCh respecting the SharedCh flag.
+func send(tx *PendingTransaction, result types.TransactionResult) {
+	if tx.SharedCh {
+		select {
+		case tx.ResultCh <- result:
+		default:
+			// Drop under back-pressure — shared channels are generously buffered;
+			// dropping is always preferable to stalling the response handler.
+		}
+	} else {
+		tx.ResultCh <- result // buffered-1 per-tx channel, never stalls
+	}
+}
+
 // Resolve matches a received response to a pending transaction.
 func (t *TransactionTracker) Resolve(seqNum uint32, responseData []byte) {
 	s := t.shard(seqNum)
@@ -91,12 +131,13 @@ func (t *TransactionTracker) Resolve(seqNum uint32, responseData []byte) {
 	delete(s.pending, seqNum)
 	s.mu.Unlock()
 
-	responseTime := time.Since(tx.SentAt)
-	tx.ResultCh <- types.TransactionResult{
+	send(tx, types.TransactionResult{
 		SeqNum:       seqNum,
 		Response:     responseData,
-		ResponseTime: responseTime,
-	}
+		ResponseTime: time.Since(tx.SentAt),
+		Owner:        tx.Owner,
+		MsgType:      tx.MsgType,
+	})
 }
 
 // StartTimeoutMonitor starts a goroutine that checks for timed-out transactions.
@@ -167,10 +208,12 @@ func (t *TransactionTracker) handleTimeout(tx *PendingTransaction) {
 			"retries": t.maxRetries,
 		}).Error("Transaction failed after max retries")
 
-		tx.ResultCh <- types.TransactionResult{
-			SeqNum: tx.SeqNum,
-			Error:  fmt.Errorf("timeout after %d retries", t.maxRetries),
-		}
+		send(tx, types.TransactionResult{
+			SeqNum:  tx.SeqNum,
+			Error:   fmt.Errorf("timeout after %d retries", t.maxRetries),
+			Owner:   tx.Owner,
+			MsgType: tx.MsgType,
+		})
 	}
 }
 
@@ -192,10 +235,12 @@ func (t *TransactionTracker) CancelAll() {
 		s := &t.shards[i]
 		s.mu.Lock()
 		for seqNum, tx := range s.pending {
-			tx.ResultCh <- types.TransactionResult{
-				SeqNum: seqNum,
-				Error:  fmt.Errorf("cancelled"),
-			}
+			send(tx, types.TransactionResult{
+				SeqNum:  seqNum,
+				Error:   fmt.Errorf("cancelled"),
+				Owner:   tx.Owner,
+				MsgType: tx.MsgType,
+			})
 			delete(s.pending, seqNum)
 		}
 		s.mu.Unlock()

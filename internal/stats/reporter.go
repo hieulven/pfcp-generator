@@ -9,19 +9,31 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	log "github.com/sirupsen/logrus"
 )
 
+// ControlState holds a snapshot of the TPS scheduler state for display.
+type ControlState struct {
+	SendQDepth    int64
+	LivePoolDepth int64
+	InFlight      int64
+	ActiveSess    int64
+	StarvedTokens int64
+	DroppedTokens int64
+}
+
 // Reporter outputs statistics to console and/or file.
 type Reporter struct {
-	collector   *Collector
-	intervalSec int
-	exportFile  string
-	targetTPS   int
+	collector    *Collector
+	intervalSec  int
+	exportFile   string
+	targetTPS    int
 	getTargetTPS func() int // live getter, overrides targetTPS if set
+	controlState atomic.Pointer[func() ControlState]
 
 	// CSV time-series export
 	csvFile    string
@@ -54,6 +66,12 @@ func (r *Reporter) SetTargetTPS(tps int) {
 // When set, this overrides the static targetTPS value.
 func (r *Reporter) SetTargetTPSFunc(fn func() int) {
 	r.getTargetTPS = fn
+}
+
+// SetControlStateFunc registers a function that returns current PI controller state.
+// Called each dashboard tick and CSV row write.
+func (r *Reporter) SetControlStateFunc(fn func() ControlState) {
+	r.controlState.Store(&fn)
 }
 
 // SetCSVFile sets the path for CSV time-series export.
@@ -219,6 +237,7 @@ func (r *Reporter) initCSV() error {
 		"est_req_sent", "est_req_success", "est_req_timeout",
 		"mod_req_sent", "mod_req_success", "mod_req_timeout",
 		"del_req_sent", "del_req_success", "del_req_timeout",
+		"sendq_depth", "livepool_depth", "inflight", "starved_tokens", "dropped_tokens",
 	}
 	if err := r.csvWriter.Write(header); err != nil {
 		fd.Close()
@@ -258,6 +277,15 @@ func (r *Reporter) writeCSVRow(snap *CollectorSnapshot, currentTPS, avgTPS float
 	if r.getTargetTPS != nil {
 		displayTargetTPS = r.getTargetTPS()
 	}
+	var sendQDepth, livePoolDepth, inFlight, starved, dropped int64
+	if fn := r.controlState.Load(); fn != nil {
+		cs := (*fn)()
+		sendQDepth = cs.SendQDepth
+		livePoolDepth = cs.LivePoolDepth
+		inFlight = cs.InFlight
+		starved = cs.StarvedTokens
+		dropped = cs.DroppedTokens
+	}
 	row := []string{
 		time.Now().Format("2006-01-02T15:04:05.000"),
 		fmt.Sprintf("%.1f", elapsed.Seconds()),
@@ -279,6 +307,8 @@ func (r *Reporter) writeCSVRow(snap *CollectorSnapshot, currentTPS, avgTPS float
 		fmt.Sprintf("%d", est.Sent), fmt.Sprintf("%d", est.Success), fmt.Sprintf("%d", est.Timeout),
 		fmt.Sprintf("%d", mod.Sent), fmt.Sprintf("%d", mod.Success), fmt.Sprintf("%d", mod.Timeout),
 		fmt.Sprintf("%d", del.Sent), fmt.Sprintf("%d", del.Success), fmt.Sprintf("%d", del.Timeout),
+		fmt.Sprintf("%d", sendQDepth), fmt.Sprintf("%d", livePoolDepth),
+		fmt.Sprintf("%d", inFlight), fmt.Sprintf("%d", starved), fmt.Sprintf("%d", dropped),
 	}
 	if err := r.csvWriter.Write(row); err != nil {
 		log.WithError(err).Warn("Failed to write CSV row")
@@ -486,6 +516,16 @@ func (r *Reporter) FormatDashboard() string {
 			fmtRespTime(snap.RespP99), fmtRespTime(snap.RespMax)))
 	} else {
 		fullRow(" Response   (no data)")
+	}
+
+	// ─── Scheduler state ───
+	fullSep("├", "─", "┤")
+	if fn := r.controlState.Load(); fn != nil {
+		cs := (*fn)()
+		fullRow(fmt.Sprintf(" Scheduler  SendQ:%-7d Pool:%-7d InFlt:%-7d Starved:%-6d Dropped:%d",
+			cs.SendQDepth, cs.LivePoolDepth, cs.InFlight, cs.StarvedTokens, cs.DroppedTokens))
+	} else {
+		fullRow(" Scheduler  (no data)")
 	}
 
 	// ─── Message Type Table ───

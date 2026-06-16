@@ -24,6 +24,10 @@ type SessionInfo struct {
 	UEIP               net.IP    // Allocated UE IP
 	State              string    // "establishing", "established", "modifying", "deleting", "deleted"
 	CreatedAt          time.Time
+	// Stress-mode scheduler state (written exclusively by the scheduler goroutine).
+	TemplateIdx   int // index into PreEncodedTemplate slice
+	ModsRemaining int // number of modifications left to send
+	NextModIdx    int // index of the next mod to send in tmpl.ModMsgs
 }
 
 // TransactionResult holds the outcome of a PFCP transaction.
@@ -32,6 +36,11 @@ type TransactionResult struct {
 	Response     []byte
 	ResponseTime time.Duration
 	Error        error
+	// Owner is set for transactions registered via TrackWith; carries the
+	// originating session so the result collector needs no seq→session map.
+	Owner *SessionInfo
+	// MsgType is the request message type name (e.g. "SessionEstablishmentRequest").
+	MsgType string
 }
 
 // SEIDMapping represents a mapping from original CP SEID to original remote (UP) SEID,
@@ -43,10 +52,10 @@ type SEIDMapping struct {
 
 // MessageStats holds per-message-type statistics.
 type MessageStats struct {
-	Sent         uint64
-	Received     uint64
-	Success      uint64
-	Failed       uint64
-	Timeout      uint64
-	Retransmit   uint64
+	Sent       uint64
+	Received   uint64
+	Success    uint64
+	Failed     uint64
+	Timeout    uint64
+	Retransmit uint64
 }
