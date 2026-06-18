@@ -89,14 +89,18 @@ func TestExporterStartServesOverHTTP(t *testing.T) {
 		t.Errorf("unexpected /metrics body:\n%s", body)
 	}
 
-	// /healthz returns 200.
+	// /healthz returns 200 with a non-empty body.
 	hResp, err := http.Get("http://" + addr + "/healthz")
 	if err != nil {
 		t.Fatalf("GET /healthz failed: %v", err)
 	}
+	hBody, _ := io.ReadAll(hResp.Body)
 	hResp.Body.Close()
 	if hResp.StatusCode != http.StatusOK {
 		t.Errorf("GET /healthz status = %d, want 200", hResp.StatusCode)
+	}
+	if strings.TrimSpace(string(hBody)) != "ok" {
+		t.Errorf("GET /healthz body = %q, want %q", string(hBody), "ok\n")
 	}
 
 	// Cancelling the context shuts the server down.

@@ -7,6 +7,7 @@ package metrics
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sort"
@@ -49,7 +50,11 @@ func (e *Exporter) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc(e.path, e.handleMetrics)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
+		if _, err := io.WriteString(w, "ok\n"); err != nil {
+			log.WithError(err).Debug("Failed to write healthz response")
+		}
 	})
 	e.server = &http.Server{Handler: mux}
 
