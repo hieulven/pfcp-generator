@@ -98,8 +98,6 @@ file, modifying session-specific identifiers, and replaying them to a target UPF
 	bindFlag(v, rootCmd, "strip-ipv6", "session.strip_ipv6")
 	bindFlag(v, rootCmd, "repeat", "input.repeat_count")
 	bindFlag(v, rootCmd, "repeat-interval", "timing.repeat_interval_ms")
-	bindFlag(v, rootCmd, "metrics", "metrics.enabled")
-	bindFlag(v, rootCmd, "metrics-port", "metrics.port")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -554,5 +552,14 @@ func bindViperFlags(v *viper.Viper, cmd *cobra.Command) {
 	if cmd.Flags().Changed("control-port") {
 		val, _ := cmd.Flags().GetInt("control-port")
 		v.Set("stress.control_port", val)
+	}
+	// Metrics exporter flags
+	if cmd.Flags().Changed("metrics") {
+		val, _ := cmd.Flags().GetBool("metrics")
+		v.Set("metrics.enabled", val)
+	}
+	if cmd.Flags().Changed("metrics-port") {
+		val, _ := cmd.Flags().GetInt("metrics-port")
+		v.Set("metrics.port", val)
 	}
 }

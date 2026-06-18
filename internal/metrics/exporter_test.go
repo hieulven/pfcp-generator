@@ -1,6 +1,9 @@
 package metrics
 
 import (
+	"context"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -47,6 +50,78 @@ func TestExporterServesExpectedMetrics(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("expected metrics output to contain %q, got:\n%s", want, body)
 		}
+	}
+}
+
+// TestExporterStartServesOverHTTP exercises the full lifecycle: Start binds a
+// real listener, /metrics and /healthz respond, and cancelling the context
+// shuts the server down.
+func TestExporterStartServesOverHTTP(t *testing.T) {
+	collector := stats.NewCollector()
+	collector.RecordSent("Heartbeat Request")
+	collector.RecordSuccess("Heartbeat Request", 3*time.Millisecond)
+
+	// Reserve a free port, then release it for the exporter to bind.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to reserve port: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	exporter := NewExporter(collector, addr, "/metrics")
+	if err := exporter.Start(ctx); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+
+	// /metrics returns recorded data.
+	resp, err := http.Get("http://" + addr + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /metrics status = %d", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), `pfcp_messages_sent_total{msg_type="Heartbeat Request"} 1`) {
+		t.Errorf("unexpected /metrics body:\n%s", body)
+	}
+
+	// /healthz returns 200.
+	hResp, err := http.Get("http://" + addr + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz failed: %v", err)
+	}
+	hResp.Body.Close()
+	if hResp.StatusCode != http.StatusOK {
+		t.Errorf("GET /healthz status = %d, want 200", hResp.StatusCode)
+	}
+
+	// Cancelling the context shuts the server down.
+	cancel()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := http.Get("http://" + addr + "/metrics"); err != nil {
+			return // server is down, as expected
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("server still serving after context cancel")
+}
+
+// TestExporterStartPortInUse verifies Start surfaces a bind error.
+func TestExporterStartPortInUse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to bind holding listener: %v", err)
+	}
+	defer ln.Close()
+
+	exporter := NewExporter(stats.NewCollector(), ln.Addr().String(), "/metrics")
+	if err := exporter.Start(context.Background()); err == nil {
+		t.Errorf("expected Start to fail on port already in use, got nil")
 	}
 }
 
