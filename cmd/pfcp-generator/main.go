@@ -14,6 +14,7 @@ import (
 
 	"pfcp-generator/internal/config"
 	"pfcp-generator/internal/control"
+	"pfcp-generator/internal/metrics"
 	"pfcp-generator/internal/network"
 	"pfcp-generator/internal/pcap"
 	"pfcp-generator/internal/session"
@@ -75,6 +76,10 @@ file, modifying session-specific identifiers, and replaying them to a target UPF
 
 	// Control server
 	rootCmd.Flags().Int("control-port", 0, "TCP port for runtime control (0=disabled, overrides config)")
+
+	// Prometheus metrics exporter
+	rootCmd.Flags().Bool("metrics", false, "Enable Prometheus metrics exporter")
+	rootCmd.Flags().Int("metrics-port", 0, "Prometheus metrics exporter port (overrides config)")
 
 	// Bind CLI flags to viper
 	v := viper.New()
@@ -233,6 +238,15 @@ func run(cmd *cobra.Command, args []string) error {
 	// Create stats collector and reporter
 	statsCollector := stats.NewCollector()
 	reporter := stats.NewReporter(statsCollector, cfg.Stats.ReportIntervalSec, cfg.Stats.ExportFile)
+
+	// Start Prometheus metrics exporter, if enabled
+	if cfg.Metrics.Enabled {
+		addr := fmt.Sprintf("%s:%d", cfg.Metrics.Address, cfg.Metrics.Port)
+		exporter := metrics.NewExporter(statsCollector, addr, cfg.Metrics.Path)
+		if err := exporter.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start metrics exporter: %w", err)
+		}
+	}
 
 	// Start periodic report only for normal mode (stress mode uses live dashboard)
 	if cfg.Stats.Enabled && !cfg.Stress.Enabled {
@@ -538,5 +552,14 @@ func bindViperFlags(v *viper.Viper, cmd *cobra.Command) {
 	if cmd.Flags().Changed("control-port") {
 		val, _ := cmd.Flags().GetInt("control-port")
 		v.Set("stress.control_port", val)
+	}
+	// Metrics exporter flags
+	if cmd.Flags().Changed("metrics") {
+		val, _ := cmd.Flags().GetBool("metrics")
+		v.Set("metrics.enabled", val)
+	}
+	if cmd.Flags().Changed("metrics-port") {
+		val, _ := cmd.Flags().GetInt("metrics-port")
+		v.Set("metrics.port", val)
 	}
 }

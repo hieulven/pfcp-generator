@@ -54,3 +54,10 @@ stress:
   tps: 50000                     # Target transactions per second
   active_sessions: 10000         # Max concurrent active sessions
   duration_sec: 0                # Test duration in seconds (0 = unlimited)
+
+# Prometheus metrics exporter
+metrics:
+  enabled: false                 # Enable the /metrics HTTP endpoint
+  address: "0.0.0.0"             # Address to bind the metrics server
+  port: 9090                     # Port to serve metrics on
+  path: "/metrics"               # HTTP path for the metrics endpoint

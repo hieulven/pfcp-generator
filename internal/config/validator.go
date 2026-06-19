@@ -99,6 +99,11 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Metrics exporter validation
+	if c.Metrics.Enabled && (c.Metrics.Port <= 0 || c.Metrics.Port > 65535) {
+		errs = append(errs, fmt.Sprintf("metrics.port must be between 1 and 65535, got %d", c.Metrics.Port))
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("configuration errors:\n  - %s", strings.Join(errs, "\n  - "))
 	}
