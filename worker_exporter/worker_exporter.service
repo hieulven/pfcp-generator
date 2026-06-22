@@ -1,0 +1,31 @@
+[Unit]
+Description=Worker-native Prometheus exporter (cpufreq + socket drops)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/worker_exporter --config /etc/worker_exporter.conf
+Restart=on-failure
+RestartSec=2
+
+# root (or CAP_DAC_READ_SEARCH) is only needed for comm= socket->process
+# matching. If you match sockets by port alone, drop the privileges:
+#   User=nobody
+#   AmbientCapabilities=
+User=root
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+
+# Build & install:
+#   cd worker_exporter
+#   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o worker_exporter .
+#   sudo install -m 0755 worker_exporter /usr/local/bin/worker_exporter
+#   sudo install -m 0644 worker_exporter.conf /etc/worker_exporter.conf
+#   sudo install -m 0644 worker_exporter.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now worker_exporter
+#
+# CGO_ENABLED=0 yields a fully static binary (no libc dependency) that runs on
+# any worker node regardless of distro.
